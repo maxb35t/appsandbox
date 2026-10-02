@@ -20,7 +20,8 @@ suggestions, so this fork is long-lived. Its patch set is kept small and self-co
 1. Download the `appsandbox-fork-x64-<sha>` artifact from the **fork build** workflow run.
 2. Stop App Sandbox (close the window or stop the headless daemon).
 3. In the upstream release folder that matches the fork's base version, back up
-   `AppSandbox.exe` and `appsandbox_core.dll`. Then replace them with the artifact's copies.
+   `AppSandbox.exe`, `appsandbox_core.dll` and `web\app.js`. Then replace them with the
+   artifact's copies (`app.js` is the GUI script; the GUI isn't needed for headless use).
 4. Start App Sandbox. `/v1/version` should report `…+mx.N`.
 
 To roll back, restore the two backed-up files.
@@ -31,5 +32,5 @@ To roll back, restore the two backed-up files.
 |---|---|
 | Fork version tag and CI build | done |
 | Dedicated relay channel: Hyper-V socket port 8, per VM, `relayChannel` (off by default) | done |
-| Chained snapshots (snapshot the current branch) | planned |
+| Chained snapshots: snapshot the current branch; snapshots report `parent`; deleting a snapshot with children is refused (409) | done |
 | Throwaway concurrent instances from a snapshot | planned |

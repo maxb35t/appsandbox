@@ -17,7 +17,12 @@
 #define MAX_BRANCHES  8
 
 /*
- * Snapshot tree — all forks off a frozen base disk, each with working branches.
+ * Snapshot tree — frozen disks layered on the base, each with working branches.
+ *
+ * maxb35t fork: snapshots can chain. Taking a snapshot while on a branch freezes that
+ * branch's disk as the new snapshot (its parent is the snapshot or base the branch was on)
+ * and continues on a fresh branch layered on it. Upstream always layered a new, empty
+ * snapshot on the base, so a branch's changes were silently left out.
  *
  * Filesystem layout:
  *   MyVM/
@@ -42,7 +47,8 @@ typedef struct {
 typedef struct {
     wchar_t      guid[64];
     wchar_t      name[128];            /* editable friendly name */
-    wchar_t      snap_vhdx[MAX_PATH];  /* diff of base — frozen snapshot disk */
+    wchar_t      snap_vhdx[MAX_PATH];  /* frozen snapshot disk (diff of its parent) */
+    wchar_t      parent_guid[64];      /* fork: parent snapshot's guid; empty = the base */
     FILETIME     created;
     BOOL         valid;
     BranchEntry  branches[MAX_BRANCHES];
@@ -64,9 +70,14 @@ void snapshot_init(SnapshotTree *tree, const wchar_t *base_dir);
 /* Persist snapshot tree metadata to tree.dat. */
 void snapshot_save(SnapshotTree *tree);
 
-/* Take a new snapshot: freeze current state as a named fork of the base.
-   VM must be stopped.  Auto-creates first branch and sets instance->vhdx_path.
-   base_vhdx is captured from instance->vhdx_path on the first call. */
+/* Take a new snapshot of the VM's current disk. VM must be stopped.
+   On a branch: the branch's disk becomes the frozen snapshot (renamed to
+   snapshot_{GUID}.vhdx), parented on the branch's snapshot (or the base), and a new
+   branch with the old branch's name continues on top of it.
+   On the base or a frozen snapshot disk: a new, empty snapshot is layered on it, with a
+   "Default Branch" (upstream behaviour for the base).
+   Sets instance->vhdx_path to the new branch. base_vhdx is captured from
+   instance->vhdx_path on the first call. */
 HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *name);
 
 /* Create a new branch off a snapshot or base.
@@ -82,7 +93,9 @@ HRESULT snapshot_select_branch(SnapshotTree *tree, VmInstance *instance, int ind
 /* Fork a frozen disk before booting. S_FALSE if the selected disk is unchanged. */
 HRESULT snapshot_ensure_writable(SnapshotTree *tree, VmInstance *instance);
 
-/* Delete a snapshot and all its branches. */
+/* Delete a snapshot and all its branches.
+   fork: refused with HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY) while other snapshots are
+   layered on it (delete those first). */
 HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index);
 
 /* Delete a single branch.
@@ -92,6 +105,13 @@ HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int ind
 /* Find which snapshot and branch match vhdx_path.
    Sets *snap_idx (-2=base, >=0=snapshot, -1=unknown) and *branch_idx (-1 if none). */
 ASB_API void snapshot_find_current(SnapshotTree *tree, const wchar_t *vhdx_path, int *snap_idx, int *branch_idx);
+
+/* fork: parent of snapshot[index]: -2 = the base, >= 0 = another snapshot's index,
+   -1 = invalid index or parent not found. */
+ASB_API int snapshot_parent_index(SnapshotTree *tree, int index);
+
+/* fork: TRUE if any snapshot is layered on snapshot[index]. */
+ASB_API BOOL snapshot_has_children(SnapshotTree *tree, int index);
 
 /* Get the last-write time of a branch file.  Returns FALSE if not found. */
 ASB_API BOOL snapshot_get_branch_time(SnapshotTree *tree, int snap_idx, int branch_idx, FILETIME *ft);

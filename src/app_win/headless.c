@@ -1020,7 +1020,8 @@ static int handle_request(PHTTP_REQUEST req)
                     if (semitted++) pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",");
                     pos += sprintf_s(buf + pos, sizeof(buf) - pos, "{\"index\":%d,\"name\":", info.index);
                     pos  = append_wstr(buf, sizeof(buf), pos, info.name);
-                    pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",\"branchCount\":%d,\"branches\":[", info.branch_count);
+                    pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",\"parent\":%d,\"branchCount\":%d,\"branches\":[",
+                                     info.parent_index, info.branch_count);   /* fork: parent (-2 = base) */
                     bemitted = 0;
                     for (b = 0; b < info.branch_count; b++) {
                         AsbBranchInfo bi;
@@ -1089,7 +1090,15 @@ static int handle_request(PHTTP_REQUEST req)
                                  "the base is not a deletable snapshot; delete a base branch via .../snapshots/-2/branches/{i}");
                         return 0;
                     }
-                    send_hr(req->RequestId, "snapDelete", nu, asb_snap_delete(vm, sidx));
+                    {
+                        HRESULT dhr = asb_snap_delete(vm, sidx);
+                        if (dhr == HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY)) {   /* fork */
+                            send_err(req->RequestId, 409, "Conflict", "snapshot_has_children",
+                                     "other snapshots are built on this snapshot; delete them first");
+                            return 0;
+                        }
+                        send_hr(req->RequestId, "snapDelete", nu, dhr);
+                    }
                     return 0;
                 }
                 if (verb == HttpVerbPUT) {   /* rename; branchIndex optional (-1 = the snapshot itself) */

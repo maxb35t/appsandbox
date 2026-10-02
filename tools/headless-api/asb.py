@@ -153,7 +153,9 @@ class Client:
     def snapshots(self, name):   return self._req("GET", "/vms/%s/snapshots" % name)[1].get("snapshots", [])
     def snapshots_full(self, name): return self._req("GET", "/vms/%s/snapshots" % name)[1]  # incl. "current"
     def snap_take(self, name, snapname=None):
-        """Take a snapshot -- the VM must be STOPPED (409 vm_running otherwise)."""
+        """Take a snapshot -- the VM must be STOPPED (409 vm_running otherwise).
+        maxb35t fork: snapshots the disk the VM is currently on; on a branch, that
+        branch becomes the snapshot and work continues on a new branch layered on it."""
         return self._req("POST", "/vms/%s/snapshots" % name, {"name": snapname} if snapname else {})
     def snap_delete(self, name, index):
         return self._req("DELETE", "/vms/%s/snapshots/%d" % (name, index))

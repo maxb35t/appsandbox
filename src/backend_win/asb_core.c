@@ -4166,7 +4166,9 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
     hr = snapshot_delete(&g_snap_trees[idx], &g_vms[idx], snap_idx);
-    if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
+    if (hr == HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY))   /* fork: chained snapshots */
+        asb_alert(L"Other snapshots are built on this snapshot. Delete them first.");
+    else if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
     else asb_log(L"Snapshot deleted.");
 
     save_vm_list();
@@ -4244,6 +4246,7 @@ ASB_API BOOL asb_snap_get_info(AsbVm vm, int snap_idx, AsbSnapshotInfo *out)
     wcscpy_s(out->name, 128, g_snap_trees[idx].nodes[snap_idx].name);
     wcscpy_s(out->guid, 64, g_snap_trees[idx].nodes[snap_idx].guid);
     out->branch_count = g_snap_trees[idx].nodes[snap_idx].branch_count;
+    out->parent_index = snapshot_parent_index(&g_snap_trees[idx], snap_idx);
     return TRUE;
 }
 
