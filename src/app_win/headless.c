@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <wchar.h>
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
