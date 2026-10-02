@@ -11,6 +11,11 @@ BOOL webview2_init(HWND parent, HINSTANCE hInstance);
    Safe to call before WebView2 is ready (messages are queued). */
 void webview2_post(const wchar_t *json);
 
+/* fork: when set, webview2_post hands every message to the hook instead of the
+   WebView (the headless daemon serving an attached GUI). Thread-safe hook required. */
+typedef void (*WebView2PostHook)(const wchar_t *json);
+void webview2_set_post_hook(WebView2PostHook hook);
+
 /* Flush queued messages. Call when JS signals it is ready. */
 void webview2_flush_queue(void);
 

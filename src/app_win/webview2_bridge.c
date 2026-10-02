@@ -372,9 +372,17 @@ BOOL webview2_init(HWND parent, HINSTANCE hInstance)
     return TRUE;
 }
 
+static WebView2PostHook g_post_hook = NULL;   /* fork */
+
+void webview2_set_post_hook(WebView2PostHook hook)
+{
+    g_post_hook = hook;
+}
+
 void webview2_post(const wchar_t *json)
 {
     if (!json) return;
+    if (g_post_hook) { g_post_hook(json); return; }   /* fork: daemon serving a GUI */
 
     if (g_ready && g_webview) {
         g_webview->lpVtbl->PostWebMessageAsJson(g_webview, json);

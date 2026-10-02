@@ -33,6 +33,7 @@
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
+#include "ui.h"                /* fork: serving an attached GUI (ui_served_*) */
 
 #pragma comment(lib, "httpapi.lib")
 
@@ -57,6 +58,8 @@
 /* forward decls (used by the event callbacks defined below) */
 static void broadcast_event(const char *json);
 static int  append_wstr(char *out, int cap, int pos, const wchar_t *w);
+static volatile LONG g_ui_clients;   /* fork: attached GUIs (defined below) */
+static HANDLE g_ui_refresh_ev;       /* fork */
 
 /* ---- SSE event broadcast (GET /v1/events) ---- */
 #define EV_CAP 256
@@ -167,7 +170,12 @@ static void hlog(const wchar_t *fmt, ...)
     LeaveCriticalSection(&g_log_cs);
 }
 
-static void core_log_cb(const wchar_t *message, void *ud) { (void)ud; hlog(L"[core] %s", message); }
+static void core_log_cb(const wchar_t *message, void *ud)
+{
+    (void)ud;
+    hlog(L"[core] %s", message);
+    if (g_ui_clients) ui_served_log(message);   /* fork: attached GUI's log panel */
+}
 
 /* Event callbacks. They fire on background / HCS / worker threads -- and
    SYNCHRONOUSLY on the request thread mid-command. Strictly non-blocking and
@@ -181,6 +189,7 @@ static void state_cb(AsbVm vm, BOOL running, void *ud)
     pos = append_wstr(ev, sizeof(ev), pos, asb_vm_name(vm));
     sprintf_s(ev + pos, sizeof(ev) - pos, ",\"running\":%s}", running ? "true" : "false");
     broadcast_event(ev);
+    if (g_ui_refresh_ev) SetEvent(g_ui_refresh_ev);   /* fork: attached GUI */
 }
 static void progress_cb(AsbVm vm, int pct, BOOL staging, void *ud)
 {
@@ -191,6 +200,7 @@ static void progress_cb(AsbVm vm, int pct, BOOL staging, void *ud)
     pos = append_wstr(ev, sizeof(ev), pos, asb_vm_name(vm));
     sprintf_s(ev + pos, sizeof(ev) - pos, ",\"progress\":%d,\"staging\":%s}", pct, staging ? "true" : "false");
     broadcast_event(ev);
+    if (g_ui_refresh_ev) SetEvent(g_ui_refresh_ev);   /* fork: attached GUI */
 }
 static void alert_cb(const wchar_t *message, void *ud)
 {
@@ -201,6 +211,54 @@ static void alert_cb(const wchar_t *message, void *ud)
     pos = append_wstr(ev, sizeof(ev), pos, message);
     sprintf_s(ev + pos, sizeof(ev) - pos, "}");
     broadcast_event(ev);
+    if (g_ui_clients) ui_served_alert(message);   /* fork: attached GUI */
+}
+
+/* fork: opens (or brings to front) a VM's display window. Shared by the display route
+   and an attached GUI's display button. Returns an HTTP status; on failure *code and
+   *msg describe why. Called with g_disp_cs held. */
+static int display_open_vm(AsbVm vm, const char **code, const char **msg)
+{
+    VmInstance *v = asb_vm_instance(vm);
+    DisplayEntry *e;
+    *code = ""; *msg = "";
+    if (!v) { *code = "not_found"; *msg = "no such VM"; return 404; }
+    display_reap_stale(v->unique_id);   /* drop a self-closed (X) display first */
+    if (!host_can_show_window()) {
+        *code = "no_display";
+        *msg = "no local interactive desktop is available to show the window "
+               "(the daemon is in a non-interactive/service session)";
+        return 409;
+    }
+    if (!v->running) {
+        *code = "not_running"; *msg = "VM is not running; start it before opening the display";
+        return 409;
+    }
+    /* Gate on display readiness -- a passive read of agent-online + the agent's latched
+       idd_status (display driver up). It never probes the frame channel, so the check
+       itself can't steal the single consumer slot or blank the display. */
+    if (!asb_vm_idd_ready(vm)) {
+        *code = "display_not_ready"; *msg = "the VM's virtual display driver is not up yet; retry shortly";
+        return 409;
+    }
+    e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
+    if (e) {
+        vm_display_idd_focus(e->disp);   /* already open -> bring to front */
+        return 200;
+    }
+    {
+        int slot; for (slot = 0; slot < ASB_MAX_VMS && g_displays[slot].vm_id; slot++) {}
+        if (slot == ASB_MAX_VMS) { *code = "too_many"; *msg = "no free display slot"; return 503; }
+        e = &g_displays[slot];
+    }
+    e->disp = vm_display_idd_create(v, g_hinst, NULL);
+    if (!e->disp) {
+        e->vm_id = 0;
+        *code = "display_failed"; *msg = "failed to create the display window";
+        return 500;
+    }
+    e->vm_id = v->unique_id;
+    return 200;
 }
 
 /* ---- ProgramData paths ---- */
@@ -491,6 +549,63 @@ static void broadcast_event(const char *json)
     LeaveCriticalSection(&g_ev_cs);
 }
 
+/* ---- fork: UI event stream for an attached GUI ----
+   Messages the GUI's own code would post to its WebView (webview2_post is hooked to
+   ui_hook) go to a ring of their own: they are bigger than API events (a VM list is
+   tens of KB) and only matter while a GUI is attached. Shares g_ev_cs / g_ev_cv. */
+#define UI_CAP 128
+static char *g_ui_ring[UI_CAP];
+static LONG  g_ui_seq = 0;
+static volatile LONG g_ui_clients = 0;
+static char *g_ui_last_list = NULL;     /* last vmListChanged sent (skip repeats) */
+static HANDLE g_ui_refresh_ev = NULL;   /* wakes the refresh thread early */
+
+static void ui_hook(const wchar_t *json)
+{
+    static const char LIST[] = "{\"type\":\"vmListChanged\"", FULL[] = "{\"type\":\"fullState\"";
+    int n;
+    char *u;
+    if (!g_ui_clients) return;   /* no GUI attached: nothing to deliver */
+    n = WideCharToMultiByte(CP_UTF8, 0, json, -1, NULL, 0, NULL, NULL);
+    if (n <= 0 || !(u = (char *)malloc((size_t)n))) return;
+    WideCharToMultiByte(CP_UTF8, 0, json, -1, u, n, NULL, NULL);
+    EnterCriticalSection(&g_ev_cs);
+    if (strncmp(u, LIST, sizeof(LIST) - 1) == 0) {
+        if (g_ui_last_list && strcmp(g_ui_last_list, u) == 0) {   /* unchanged */
+            LeaveCriticalSection(&g_ev_cs);
+            free(u);
+            return;
+        }
+        free(g_ui_last_list);
+        g_ui_last_list = _strdup(u);
+    } else if (strncmp(u, FULL, sizeof(FULL) - 1) == 0) {
+        free(g_ui_last_list);   /* the next list after a full state always goes out */
+        g_ui_last_list = NULL;
+    }
+    free(g_ui_ring[g_ui_seq % UI_CAP]);
+    g_ui_ring[g_ui_seq % UI_CAP] = u;
+    g_ui_seq++;
+    WakeAllConditionVariable(&g_ev_cv);
+    LeaveCriticalSection(&g_ev_cs);
+}
+
+/* Refreshes an attached GUI's VM list: every 1.5 s, or at once after a VM event.
+   The list builder reads the VM table, so it runs under g_disp_cs like a request. */
+static DWORD WINAPI ui_refresh_thread(LPVOID unused)
+{
+    (void)unused;
+    while (!g_stop_all) {
+        WaitForSingleObject(g_ui_refresh_ev, 1500);
+        if (g_stop_all) break;
+        if (!g_ui_clients) continue;
+        Sleep(100);   /* let a burst of events settle */
+        EnterCriticalSection(&g_disp_cs);
+        ui_served_refresh();
+        LeaveCriticalSection(&g_disp_cs);
+    }
+    return 0;
+}
+
 static int sse_write(HTTP_REQUEST_ID id, const char *data, int len)
 {
     HTTP_DATA_CHUNK chunk; ULONG sent = 0;
@@ -552,6 +667,66 @@ static DWORD WINAPI sse_thread(LPVOID param)
         for (i = 0; i < nframes; i++) free(frames[i]);
         if (!alive) break;   /* client disconnected */
     }
+    return 0;
+}
+
+/* fork: one thread per attached GUI. Like sse_thread, for the UI ring. */
+static DWORD WINAPI ui_sse_thread(LPVOID param)
+{
+    HTTP_REQUEST_ID id = *(HTTP_REQUEST_ID *)param;
+    HTTP_RESPONSE resp; ULONG sent = 0;
+    LONG my_seq;
+    free(param);
+
+    /* Subscribe before the headers go out: the GUI asks for the full state as soon as
+       it sees them, and that reply must not be missed. */
+    EnterCriticalSection(&g_ev_cs);
+    my_seq = g_ui_seq;
+    LeaveCriticalSection(&g_ev_cs);
+    InterlockedIncrement(&g_ui_clients);
+
+    RtlZeroMemory(&resp, sizeof(resp));
+    resp.StatusCode = 200; resp.pReason = "OK"; resp.ReasonLength = 2;
+    resp.Headers.KnownHeaders[HttpHeaderContentType].pRawValue = "text/event-stream";
+    resp.Headers.KnownHeaders[HttpHeaderContentType].RawValueLength = (USHORT)strlen("text/event-stream");
+    resp.Headers.KnownHeaders[HttpHeaderCacheControl].pRawValue = "no-cache";
+    resp.Headers.KnownHeaders[HttpHeaderCacheControl].RawValueLength = (USHORT)strlen("no-cache");
+    if (HttpSendHttpResponse(g_req_queue, id, HTTP_SEND_RESPONSE_FLAG_MORE_DATA,
+                             &resp, NULL, &sent, NULL, 0, NULL, NULL) != NO_ERROR) {
+        InterlockedDecrement(&g_ui_clients);
+        return 0;
+    }
+    hlog(L"GUI attached (%ld attached).", g_ui_clients);
+
+    while (!g_stop_all) {
+        char *frames[32]; int nframes = 0, i, alive = 1;
+        EnterCriticalSection(&g_ev_cs);
+        while (my_seq == g_ui_seq && !g_stop_all)
+            if (!SleepConditionVariableCS(&g_ev_cv, &g_ev_cs, 15000)) break;   /* heartbeat */
+        if (g_ui_seq - my_seq > UI_CAP) my_seq = g_ui_seq - UI_CAP;           /* skip dropped */
+        while (my_seq < g_ui_seq && nframes < 32) {
+            char *m = g_ui_ring[my_seq % UI_CAP];
+            frames[nframes++] = m ? _strdup(m) : NULL;
+            my_seq++;
+        }
+        LeaveCriticalSection(&g_ev_cs);
+
+        if (nframes == 0) {
+            alive = sse_write(id, ": ping\n\n", 8);
+        } else {
+            for (i = 0; i < nframes && alive; i++) {
+                if (frames[i]) {
+                    alive = sse_write(id, "data: ", 6) &&
+                            sse_write(id, frames[i], (int)strlen(frames[i])) &&
+                            sse_write(id, "\n\n", 2);
+                }
+            }
+        }
+        for (i = 0; i < nframes; i++) free(frames[i]);
+        if (!alive) break;
+    }
+    InterlockedDecrement(&g_ui_clients);
+    hlog(L"GUI detached.");
     return 0;
 }
 
@@ -745,6 +920,43 @@ static int handle_request(PHTTP_REQUEST req)
     }
 
     /* SSE event stream -- handed to a dedicated thread so it doesn't block the loop. */
+    /* ---- fork: an attached GUI. GET /v1/ui/events streams what the GUI's WebView
+       would receive; POST /v1/ui/action runs one GUI action message. ---- */
+    if (verb == HttpVerbGET && wcscmp(path, L"/v1/ui/events") == 0) {
+        HTTP_REQUEST_ID *idp = (HTTP_REQUEST_ID *)malloc(sizeof(HTTP_REQUEST_ID));
+        if (idp) {
+            HANDLE h;
+            *idp = req->RequestId;
+            h = CreateThread(NULL, 0, ui_sse_thread, idp, 0, NULL);
+            if (h) CloseHandle(h); else { free(idp); send_err(req->RequestId, 500, "Internal Server Error", "thread", "spawn failed"); }
+        }
+        return 0;   /* response owned by the UI SSE thread */
+    }
+    if (verb == HttpVerbPOST && wcscmp(path, L"/v1/ui/action") == 0) {
+        static wchar_t abody[8192];
+        wchar_t action[64] = { 0 };
+        int idx;
+        if (!body_to_wide(req, abody, 8192) || !json_get_string(abody, L"action", action, 64)) {
+            send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "expected a GUI action message");
+            return 0;
+        }
+        if (wcscmp(action, L"connectIddVm") == 0) {   /* the daemon's display windows */
+            if (json_get_int(abody, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+                const char *code, *msg;
+                if (display_open_vm(asb_vm_get(idx), &code, &msg) != 200) {
+                    wchar_t wm[256];
+                    MultiByteToWideChar(CP_UTF8, 0, msg, -1, wm, 256);
+                    ui_served_alert(wm);
+                }
+            }
+        } else {
+            ui_served_action(abody);
+        }
+        SecureZeroMemory(abody, sizeof(abody));   /* createVm carries a password */
+        send_json(req->RequestId, 200, "OK", "{\"ok\":true}");
+        return 0;
+    }
+
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/events") == 0) {
         HTTP_REQUEST_ID *idp = (HTTP_REQUEST_ID *)malloc(sizeof(HTTP_REQUEST_ID));
         if (idp) {
@@ -1206,46 +1418,12 @@ static int handle_request(PHTTP_REQUEST req)
             if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
             display_reap_stale(v->unique_id);   /* drop a self-closed (X) display first */
             if (verb == HttpVerbPOST) {
-                DisplayEntry *e;
-                if (!host_can_show_window()) {
-                    send_err(req->RequestId, 409, "Conflict", "no_display",
-                             "no local interactive desktop is available to show the window "
-                             "(the daemon is in a non-interactive/service session)");
+                const char *code, *msg;
+                int st = display_open_vm(vm, &code, &msg);
+                if (st != 200) {
+                    send_err(req->RequestId, (USHORT)st, st == 409 ? "Conflict" : st == 503 ? "Service Unavailable"
+                             : "Internal Server Error", code, msg);
                     return 0;
-                }
-                if (!v->running) {
-                    send_err(req->RequestId, 409, "Conflict", "not_running",
-                             "VM is not running; start it before opening the display");
-                    return 0;
-                }
-                /* Gate on display readiness -- a passive read of agent-online + the
-                   agent's latched idd_status (display driver up). It never probes the
-                   frame channel, so the check itself can't steal the single consumer
-                   slot or blank the display the way a connect-test would. */
-                if (!asb_vm_idd_ready(vm)) {
-                    send_err(req->RequestId, 409, "Conflict", "display_not_ready",
-                             "the VM's virtual display driver is not up yet; retry shortly");
-                    return 0;
-                }
-                e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
-                if (e) {
-                    vm_display_idd_focus(e->disp);            /* already open -> bring to front */
-                } else {
-                    int slot; for (slot = 0; slot < ASB_MAX_VMS && g_displays[slot].vm_id; slot++) {}
-                    if (slot == ASB_MAX_VMS) {
-                        send_err(req->RequestId, 503, "Service Unavailable", "too_many",
-                                 "no free display slot");
-                        return 0;
-                    }
-                    e = &g_displays[slot];
-                    e->disp = vm_display_idd_create(v, g_hinst, NULL);
-                    if (!e->disp) {
-                        e->vm_id = 0;
-                        send_err(req->RequestId, 500, "Internal Server Error", "display_failed",
-                                 "failed to create the display window");
-                        return 0;
-                    }
-                    e->vm_id = v->unique_id;
                 }
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":true}");
                 return 0;
@@ -1627,6 +1805,14 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
         HANDLE rt = CreateThread(NULL, 0, display_reaper_thread, NULL, 0, NULL);
         if (rt) CloseHandle(rt);
     }
+    {   /* fork: serve a GUI that attaches (ui.c runs on this, the request thread) */
+        HANDLE ut;
+        ui_served_init();
+        webview2_set_post_hook(ui_hook);
+        g_ui_refresh_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+        ut = CreateThread(NULL, 0, ui_refresh_thread, NULL, 0, NULL);
+        if (ut) CloseHandle(ut);
+    }
 
     hlog(L"entering request loop.");
     while (!stop) {
@@ -1653,6 +1839,7 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
 
     g_stop_all = 1;
     WakeAllConditionVariable(&g_ev_cv);   /* wake SSE threads so they exit */
+    if (g_ui_refresh_ev) SetEvent(g_ui_refresh_ev);   /* fork */
     hlog(L"stopping: removing url, deleting discovery, terminating VMs.");
     delete_discovery();
     HttpRemoveUrlFromUrlGroup(g_url_group, NULL, HTTP_URL_FLAG_REMOVE_ALL);

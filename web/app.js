@@ -151,6 +151,7 @@ window.onHostMessage = function(msg) {
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':         showModal('Error', msg.message, 'OK'); break;
         case 'proxyLog':      onProxyLog(msg.entries || []); break;   /* fork */
+        case 'attachState':   onAttachState(msg.state); break;        /* fork */
         case 'prereqRequired': onPrereqRequired(); break;
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
@@ -1365,6 +1366,21 @@ function makeIconCell(cls, icon, active, handler, extraClass, title) {
     else btn.disabled = true;
     td.appendChild(btn);
     return td;
+}
+
+/* ---- fork: attached to the headless service ---- */
+
+function onAttachState(state) {
+    var el = document.getElementById('attach-banner');
+    var text = {
+        connecting: 'Connecting to the headless service\u2026',
+        connected: 'Attached to the headless service. VMs run in the service: closing this window leaves them running.',
+        lost: 'Lost the connection to the headless service. Reconnecting\u2026 (if the service was stopped, close this window and open App Sandbox again).'
+    }[state];
+    if (!text) return;
+    el.textContent = text;
+    el.className = 'attach-banner ' + (state === 'connected' ? 'ok' : 'warn');
+    el.hidden = false;
 }
 
 /* ---- fork: Proxied network mode ---- */

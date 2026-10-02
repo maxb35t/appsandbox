@@ -36,12 +36,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     {
         HANDLE inst_mutex = CreateMutexW(NULL, FALSE, L"Global\\AppSandboxCoreHost");
         if (inst_mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-            MessageBoxW(NULL,
-                L"AppSandbox is already running (either the app window or the "
-                L"headless service). Only one can run at a time.",
-                L"App Sandbox", MB_ICONINFORMATION | MB_OK);
-            OleUninitialize();
-            return 0;
+            /* fork: if it's the headless daemon, attach to it: this window then shows
+               and controls the daemon's VMs, and closing it leaves them running. */
+            if (!ui_attach_probe()) {
+                MessageBoxW(NULL,
+                    L"AppSandbox is already running (either the app window or the "
+                    L"headless service). Only one can run at a time.",
+                    L"App Sandbox", MB_ICONINFORMATION | MB_OK);
+                OleUninitialize();
+                return 0;
+            }
         }
     }
 
