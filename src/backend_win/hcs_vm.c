@@ -3,6 +3,7 @@
 #include "ui.h"
 #include "disk_util.h"   /* ASB_IS_ARM64 */
 #include <stdio.h>
+#include <time.h>
 #include <sddl.h>
 #include <aclapi.h>
 
@@ -1481,6 +1482,7 @@ HRESULT hcs_start_vm(VmInstance *instance)
 
     if (SUCCEEDED(hr)) {
         instance->running = TRUE;
+        instance->started_at = (ULONGLONG)time(NULL);   /* fork: "this run" in Proxy activity */
 
         /* Cache RuntimeId for AF_HYPERV agent connections */
         cache_runtime_id(instance);

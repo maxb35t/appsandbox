@@ -356,6 +356,14 @@ static void build_vm_json(JsonBuilder *jb, int i)
         AsbProxyPolicy pp;
         if (asb_vm_get_proxy(asb_vm_get(i), &pp)) jb_proxy_obj(jb, L"proxy", &pp, TRUE);
     }
+    if (v->running && v->started_at) {
+        wchar_t st[32];
+        swprintf_s(st, 32, L"%llu", (unsigned long long)v->started_at);
+        jb_append(jb, jb->count > 0 ? L"," : L"");
+        jb_append(jb, L"\"startedAt\":");
+        jb_append(jb, st);
+        jb->count++;
+    }
     jb_bool(jb, L"ephemeral", v->ephemeral);
     if (v->ephemeral) {
         wchar_t exp[32];
@@ -1386,6 +1394,14 @@ static void on_webview2_message(const wchar_t *json)
         if (FAILED(asb_set_proxy_defaults(&d)))
             ui_show_alert(L"Proxy defaults not saved: ports must be a comma-separated list of numbers from 1 to 65535.");
         send_vm_list();
+    } else if (wcscmp(action, L"clearProxyLog") == 0) {
+        /* fork */
+        HRESULT hr = asb_proxy_clear_log();
+        if (FAILED(hr)) {
+            ui_log(L"Couldn't clear the proxy log (0x%08X).", hr);
+            ui_show_alert(L"Couldn't clear the proxy log.");
+        }
+        send_proxy_log(NULL, 0);
     } else if (wcscmp(action, L"getProxyLog") == 0) {
         /* fork: {vm?, limit?} */
         wchar_t vm_name[256] = { 0 };

@@ -1784,6 +1784,7 @@ done:
                     inst->handle = heap_inst->handle;
                     inst->runtime_id = heap_inst->runtime_id;
                     inst->running = TRUE;
+                    inst->started_at = heap_inst->started_at;   /* fork */
                     inst->gpu_mode = heap_inst->gpu_mode;
                     wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), heap_inst->gpu_id);
                     update_vm_gpu_name(inst);
@@ -2938,6 +2939,7 @@ done:
                     inst->handle = heap_inst->handle;
                     inst->runtime_id = heap_inst->runtime_id;
                     inst->running = TRUE;
+                    inst->started_at = heap_inst->started_at;   /* fork */
                     inst->gpu_mode = heap_inst->gpu_mode;
                     wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), heap_inst->gpu_id);
                     update_vm_gpu_name(inst);
@@ -4832,6 +4834,11 @@ ASB_API HRESULT asb_set_proxy_defaults(const AsbProxyPolicy *p)
     save_vm_list();
     proxy_refresh();
     return S_OK;
+}
+
+ASB_API HRESULT asb_proxy_clear_log(void)
+{
+    return proxy_mgr_clear_log();
 }
 
 ASB_API int asb_proxy_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap)

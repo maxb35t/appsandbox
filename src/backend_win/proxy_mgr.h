@@ -30,4 +30,8 @@ BOOL    proxy_mgr_service_running(void);
    "vm" equals vm_name, as a JSON array in out. Returns the number of lines. */
 int     proxy_mgr_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap);
 
+/* Empties proxy.log (the proxy appends, so it carries on at the new end) and deletes
+   the rotated proxy.log.1. */
+HRESULT proxy_mgr_clear_log(void);
+
 #endif

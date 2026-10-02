@@ -428,17 +428,20 @@
         <h3 id="activity-title">Proxy activity</h3>
         <div class="activity-bar">
             <label>VM: <select id="act-vm" onchange="requestActivity()"></select></label>
+            <input type="search" id="act-search" placeholder="Search site, VM or result" oninput="renderActivity()">
+            <label title="Only connections made since each VM last started (instance names are reused)"><input type="checkbox" id="act-run" checked onchange="renderActivity()"> This run only</label>
             <label><input type="checkbox" id="act-blocked" onchange="renderActivity()"> Blocked only</label>
             <label><input type="checkbox" id="act-auto" checked> Auto-refresh</label>
-            <span class="host-info" id="act-count"></span>
         </div>
+        <div class="host-info act-count" id="act-count"></div>
         <div class="activity-wrap">
             <table id="act-table">
-                <thead><tr><th>Time</th><th>VM</th><th>Request</th><th>Result</th><th>Sent</th><th>Received</th><th>ms</th></tr></thead>
+                <thead><tr><th>Time</th><th>VM</th><th>Site</th><th>Port</th><th>Type</th><th>Result</th><th class="num">Sent</th><th class="num">Received</th><th class="num">Time taken</th></tr></thead>
                 <tbody></tbody>
             </table>
         </div>
         <div class="modal-buttons">
+            <button class="danger" onclick="clearActivity()" title="Delete every logged connection (all VMs)">Clear log</button>
             <button onclick="requestActivity()">Refresh</button>
             <button onclick="closeActivityModal()">Close</button>
         </div>

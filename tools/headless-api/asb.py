@@ -212,6 +212,9 @@ class Client:
         """Recent proxy connections (newest last), optionally for one VM name."""
         q = "?limit=%d" % int(limit) + ("&vm=%s" % vm if vm else "")
         return self._req("GET", "/proxy/log" + q)[1].get("entries", [])
+    def clear_proxy_log(self):
+        """Empty the proxy connection log."""
+        return self._req("DELETE", "/proxy/log")
     def set_settings(self, **kw):
         """e.g. set_settings(instanceAutoDelete=False, instanceTtlMinutes=120, instanceFastStop=True)."""
         return self._req("PUT", "/settings", kw)

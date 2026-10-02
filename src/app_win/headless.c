@@ -334,8 +334,9 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
-    pos += sprintf_s(out + pos, cap - pos, ",\"relayChannel\":%s,\"ephemeral\":%s",
-                     v->relay_channel ? "true" : "false", v->ephemeral ? "true" : "false");   /* fork */
+    pos += sprintf_s(out + pos, cap - pos, ",\"relayChannel\":%s,\"ephemeral\":%s,\"startedAt\":%llu",
+                     v->relay_channel ? "true" : "false", v->ephemeral ? "true" : "false",
+                     (unsigned long long)(v->running ? v->started_at : 0));   /* fork */
     if (v->ephemeral) {
         pos += sprintf_s(out + pos, cap - pos, ",\"parent\":");
         pos  = append_wstr(out, cap, pos, v->parent_name);
@@ -667,6 +668,12 @@ static int handle_request(PHTTP_REQUEST req)
     display_sweep_orphans();   /* fork */
 
     /* ---- fork: proxy connection log: GET /v1/proxy/log?vm=NAME&limit=N ---- */
+    if (verb == HttpVerbDELETE && wcscmp(path, L"/v1/proxy/log") == 0) {
+        HRESULT chr = asb_proxy_clear_log();
+        if (FAILED(chr)) { send_hr(req->RequestId, "clearProxyLog", "", chr); return 0; }
+        send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"cleared\":true}");
+        return 0;
+    }
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/proxy/log") == 0) {
         wchar_t vmq[256] = { 0 };
         int limit = 100, n;

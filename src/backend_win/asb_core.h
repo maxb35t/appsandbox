@@ -252,6 +252,7 @@ ASB_API HRESULT asb_vm_set_proxy(AsbVm vm, const AsbProxyPolicy *p); /* allowed 
 ASB_API void    asb_get_proxy_defaults(AsbProxyPolicy *out);
 ASB_API HRESULT asb_set_proxy_defaults(const AsbProxyPolicy *p);
 ASB_API int     asb_proxy_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap);
+ASB_API HRESULT asb_proxy_clear_log(void);   /* empties proxy.log, removes proxy.log.1 */
 ASB_API BOOL    asb_proxy_service_running(void);
 
 ASB_API int     asb_get_instance_ttl_minutes(void);

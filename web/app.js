@@ -1521,37 +1521,91 @@ function formatBytes(n) {
     return (n / 1048576).toFixed(1) + ' MB';
 }
 
+/* Plain-words result: [label, css class]. The raw code stays in the tooltip. */
+function activityResult(res) {
+    var m;
+    if (res === 'ok') return ['Allowed', 'res-ok'];
+    if (res === 'denied:host-not-allowed') return ['Blocked: not on allow list', 'res-denied'];
+    if (res === 'denied:host-denied') return ['Blocked: on block list', 'res-denied'];
+    if (res === 'denied:private-address') return ['Blocked: LAN / private address', 'res-denied'];
+    if (res === 'denied:unknown-vm') return ['Blocked: VM has no proxy rules', 'res-denied'];
+    if (res === 'denied:max-conns') return ['Blocked: too many connections', 'res-denied'];
+    if ((m = /^denied:port-(\d+)$/.exec(res))) return ['Blocked: port ' + m[1] + ' not allowed', 'res-denied'];
+    if (res.indexOf('denied') === 0) return ['Blocked: ' + res.slice(7), 'res-denied'];
+    if (res === 'error:connect-failed') return ['Failed: couldn’t connect', 'res-error'];
+    if (res === 'error:dns-failed') return ['Failed: site name not found', 'res-error'];
+    if (res.indexOf('error') === 0) return ['Failed: ' + res.slice(6), 'res-error'];
+    return [res, ''];
+}
+
+/* "This run only": an entry counts if its VM is running now and the entry is from after
+   that VM's latest start. (Instance names, and their ids, repeat between runs.) */
+function activityInCurrentRun(e) {
+    var vm = vms[vmIndexByName(e.vm)];
+    if (!vm || !vm.running || !vm.startedAt) return false;
+    var t = Date.parse(e.t);
+    return !isNaN(t) && t / 1000 >= vm.startedAt - 1;
+}
+
 function renderActivity() {
     var tbody = document.querySelector('#act-table tbody');
     var blockedOnly = document.getElementById('act-blocked').checked;
-    var rows = activityEntries.filter(function(e) {
-        return !blockedOnly || String(e.result).indexOf('ok') !== 0;
+    var runOnly = document.getElementById('act-run').checked;
+    var q = document.getElementById('act-search').value.trim().toLowerCase();
+    var inRun = activityEntries.filter(function(e) { return !runOnly || activityInCurrentRun(e); });
+    var rows = inRun.filter(function(e) {
+        var res = String(e.result || '');
+        if (blockedOnly && res === 'ok') return false;
+        if (!q) return true;
+        return [e.host, e.vm, res, activityResult(res)[0], e.ip, e.method, String(e.port)]
+            .some(function(v) { return v && String(v).toLowerCase().indexOf(q) >= 0; });
     }).reverse();   /* newest first */
     tbody.textContent = '';
     rows.forEach(function(e) {
         var tr = document.createElement('tr');
         var res = String(e.result || '');
-        if (res.indexOf('denied') === 0) tr.className = 'act-denied';
-        else if (res.indexOf('error') === 0) tr.className = 'act-error';
+        var r = activityResult(res);
         var t = new Date(e.t);
         var when = isNaN(t) ? String(e.t || '') : t.toLocaleTimeString() +
             (t.toDateString() === new Date().toDateString() ? '' : ' ' + t.toLocaleDateString());
-        [when, e.vm || e.vmId || '?',
-         (e.method || '') + ' ' + (e.host || '') + (e.port ? ':' + e.port : ''),
-         res, formatBytes(e.up), formatBytes(e.down), e.ms
-        ].forEach(function(text, k) {
+        var cells = [
+            [when, isNaN(t) ? '' : t.toLocaleString()],
+            [e.vm || '?', e.vmId ? 'VM id ' + e.vmId : ''],
+            [e.host || '', e.ip ? 'Connected to ' + e.ip : ''],
+            [e.port || '', ''],
+            [e.method === 'CONNECT' ? 'HTTPS' : (e.method ? 'HTTP ' + e.method : ''), e.method || ''],
+            [r[0], res],
+            [formatBytes(e.up), (e.up || 0) + ' bytes', 'num'],
+            [formatBytes(e.down), (e.down || 0) + ' bytes', 'num'],
+            [e.ms != null ? (e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + ' s' : e.ms + ' ms') : '', '', 'num']
+        ];
+        cells.forEach(function(c, k) {
             var td = document.createElement('td');
-            td.textContent = text;
-            if (k === 2 && e.ip) td.title = 'Connected to ' + e.ip;
-            if (k === 1 && e.vmId) td.title = 'VM id ' + e.vmId;
+            td.textContent = c[0];
+            if (c[1]) td.title = c[1];
+            if (c[2]) td.className = c[2];
+            if (k === 5 && r[1]) td.className = r[1];
             tr.appendChild(td);
         });
         tbody.appendChild(tr);
     });
-    var blocked = activityEntries.filter(function(e) { return String(e.result).indexOf('denied') === 0; }).length;
-    document.getElementById('act-count').textContent =
-        activityEntries.length + ' connections, ' + blocked + ' blocked' +
-        (activityEntries.length ? '' : ' (nothing logged yet)');
+    var blocked = inRun.filter(function(e) { return String(e.result).indexOf('denied') === 0; }).length;
+    document.getElementById('act-count').textContent = activityEntries.length
+        ? 'Showing ' + rows.length + ' of ' + inRun.length + ' connections' +
+          (runOnly ? ' in the current run' : '') + ' · ' + blocked + ' blocked' +
+          (runOnly && inRun.length < activityEntries.length
+              ? ' · ' + (activityEntries.length - inRun.length) + ' older hidden (untick “This run only”)' : '')
+        : 'Nothing logged yet.';
+}
+
+function clearActivity() {
+    showModal('Clear proxy log', 'Delete every logged connection, for all VMs? This can’t be undone.', 'Clear log')
+        .then(function(ok) {
+            if (!ok) return;
+            activityEntries = [];
+            renderActivity();
+            sendCmd('clearProxyLog', {});
+        });
 }
 
 /* ---- VM Selection ---- */
