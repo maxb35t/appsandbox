@@ -37,7 +37,15 @@ pub fn read_head<R: Read>(r: &mut R) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
     loop {
-        let n = r.read(&mut chunk)?;
+        let n = match r.read(&mut chunk) {
+            Ok(n) => n,
+            // Nothing received at all (closed, reset or timed out, however the platform
+            // reports it): an unused connection, not a bad request.
+            Err(e) if buf.is_empty() => {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("no request: {e}")))
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client closed before a request"));
         }
@@ -155,6 +163,24 @@ pub fn response(code: u16, reason: &str, detail: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Fails(Option<&'static [u8]>);
+    impl Read for Fails {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.take() {
+                Some(d) => { buf[..d.len()].copy_from_slice(d); Ok(d.len()) }
+                None => Err(io::Error::other("timed out (any kind)")),
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_received_is_unexpected_eof_partial_is_not() {
+        let e = read_head(&mut Fails(None)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+        let e = read_head(&mut Fails(Some(b"GET http://x/ HT"))).unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::UnexpectedEof);
+    }
 
     #[test]
     fn parses_connect() {

@@ -87,9 +87,12 @@ pub fn handle(shared: &Shared, mut client: Box<dyn Duplex>, vm_id: &str) {
         let _ = client.set_read_timeout(Some(HEAD_TIMEOUT));
         let (head, extra) = match http::read_head(&mut client) {
             Ok(h) => h,
-            // Browsers open spare connections and never use them: not worth a log line.
+            // Browsers open spare connections and never use them, then close them (or, when
+            // the browser exits, reset them): not worth a log line.
             Err(e) if matches!(e.kind(), std::io::ErrorKind::UnexpectedEof
-                | std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => return "idle".into(),
+                | std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe) => return "idle".into(),
             Err(_) => return "error:bad-request".into(),
         };
         let Some(rules) = rules.as_ref() else {

@@ -1555,6 +1555,7 @@ function activityResult(res) {
     if ((m = /^denied:port-(\d+)$/.exec(res))) return ['Blocked: port ' + m[1] + ' not allowed', 'res-denied'];
     if (res.indexOf('denied') === 0) return ['Blocked: ' + res.slice(7), 'res-denied'];
     if (res === 'error:connect-failed') return ['Failed: couldn’t connect', 'res-error'];
+    if (res === 'error:bad-request') return ['Failed: not a valid proxy request', 'res-error'];
     if (res === 'error:dns-failed') return ['Failed: site name not found', 'res-error'];
     if (res.indexOf('error') === 0) return ['Failed: ' + res.slice(6), 'res-error'];
     return [res, ''];
