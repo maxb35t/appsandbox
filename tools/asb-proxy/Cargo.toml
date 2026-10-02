@@ -1,0 +1,14 @@
+[package]
+name = "asb-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Filtering HTTP/HTTPS proxy for App Sandbox VMs (maxb35t fork)"
+license = "MIT"
+
+# No dependencies on purpose: this program parses traffic from untrusted VMs, so it
+# stays small enough to read in full. Platform calls are hand-declared FFI.
+[dependencies]
+
+[profile.release]
+strip = true
+panic = "abort"
