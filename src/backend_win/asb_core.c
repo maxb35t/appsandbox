@@ -574,6 +574,8 @@ static void save_vm_list(void)
             fwprintf(f, L"SshPort=%lu\n", g_vms[i].ssh_port);
         if (g_vms[i].ssh_deploy_key)
             fwprintf(f, L"SshDeployKey=1\n");
+        if (g_vms[i].relay_channel)
+            fwprintf(f, L"RelayChannel=1\n");
         if (g_vms[i].ssh_pubkey[0])
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
@@ -727,6 +729,8 @@ static void load_vm_list(void)
             vm->ssh_port = (DWORD)_wtoi(line + 8);
         else if (wcsncmp(line, L"SshDeployKey=", 13) == 0)
             vm->ssh_deploy_key = (_wtoi(line + 13) != 0);
+        else if (wcsncmp(line, L"RelayChannel=", 13) == 0)
+            vm->relay_channel = (_wtoi(line + 13) != 0);
         else if (wcsncmp(line, L"SshPubKey=", 10) == 0)
             /* Truncating copy: wcscpy_s ABORTS the process on overflow, and this
                line comes from an editable config file. Generated ed25519 lines
@@ -3733,6 +3737,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.test_mode = inst->test_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
+        args->config.relay_channel = inst->relay_channel;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
         args->network_mode = inst->network_mode;
         inst->network_cleaned = FALSE;
@@ -4101,6 +4106,28 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
+}
+
+/* fork: enable/disable the ASB_RELAY_PORT HvSocket channel. Takes effect on the next
+   start; the compute system is rebuilt so the new ServiceTable applies. */
+ASB_API HRESULT asb_vm_set_relay_channel(AsbVm vm, BOOL enabled)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running) return E_ACCESSDENIED;
+    enabled = enabled ? TRUE : FALSE;
+    if (g_vms[idx].relay_channel == enabled) return S_OK;
+    g_vms[idx].relay_channel = enabled;
+    if (g_vms[idx].handle) hcs_close_vm(&g_vms[idx]);
+    save_vm_list();
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API BOOL asb_vm_relay_channel(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->relay_channel : FALSE;
 }
 
 /* ---- Snapshots ---- */

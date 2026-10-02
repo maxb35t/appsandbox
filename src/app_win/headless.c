@@ -272,7 +272,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
-    pos += sprintf_s(out + pos, cap - pos, "}");
+    pos += sprintf_s(out + pos, cap - pos, ",\"relayChannel\":%s}",
+                     v->relay_channel ? "true" : "false");   /* fork */
     return pos;
 }
 
@@ -858,6 +859,11 @@ static int handle_request(PHTTP_REQUEST req)
                 if (json_get_int(body, L"networkMode", &iv)) {
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
+                }
+                {   /* fork: optional relay channel (ASB_RELAY_PORT) */
+                    BOOL relay;
+                    if (json_get_bool(body, L"relayChannel", &relay))
+                        hr = asb_vm_set_relay_channel(vm, relay);
                 }
                 asb_save();
                 if (SUCCEEDED(hr)) {

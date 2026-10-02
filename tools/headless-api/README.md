@@ -191,7 +191,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode, displayOpen`.
+gpuMode, networkMode, displayOpen` (plus `relayChannel` on the maxb35t fork).
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
@@ -321,6 +321,12 @@ rather than forwarding bad input to the core.
 
 `edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode` with the same
 range rules, and **only while the VM is stopped**. `name` cannot be changed.
+
+**maxb35t fork:** `edit()` also accepts `relayChannel` (bool, default `false`). When it's on,
+the VM's Hyper-V socket channel list also includes port 8 (`a5b0cafe-0008-4000-8000-000000000001`
+for Windows guests, `00000008-facb-11e6-bd58-64006a7986d3` for Linux). A user relay can then
+use that port in either direction, for example a guest-to-host proxy relay. The change applies
+from the next start.
 
 ### SSH key deploy (password-less login)
 
