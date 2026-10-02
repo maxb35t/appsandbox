@@ -34,12 +34,18 @@ jobs:
       - name: Build AppSandbox.exe
         run: msbuild AppSandbox.sln /t:AppSandbox /p:Configuration=Release /p:Platform=x64 /v:minimal
 
+      - name: Build asb-proxy (Windows)
+        run: |
+          cargo clippy --release --manifest-path tools/asb-proxy/Cargo.toml -- -D warnings
+          cargo build --release --manifest-path tools/asb-proxy/Cargo.toml
+
       - name: Collect binaries
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out\web | Out-Null
           Copy-Item bin\Release\AppSandbox.exe, bin\Release\appsandbox_core.dll out\
           Copy-Item web\* out\web\
+          Copy-Item tools\asb-proxy\target\release\asb-proxy.exe out\
           Get-ChildItem out -File -Recurse -Exclude SHA256SUMS.txt | ForEach-Object {
             '{0}  {1}  {2}' -f (Get-FileHash $_.FullName).Hash, $_.VersionInfo.FileVersion, $_.Name
           } | Tee-Object -FilePath out\SHA256SUMS.txt
@@ -48,4 +54,24 @@ jobs:
         with:
           name: appsandbox-fork-x64-${{ github.sha }}
           path: out\
+          if-no-files-found: error
+
+  asb-proxy-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test and build asb-proxy (Linux guest side + shared logic)
+        working-directory: tools/asb-proxy
+        run: |
+          cargo test --release
+          cargo clippy --release --all-targets -- -D warnings
+          cargo build --release
+          mkdir -p out && cp target/release/asb-proxy out/asb-proxy-linux-x64
+          sha256sum out/asb-proxy-linux-x64 | tee out/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asb-proxy-linux-x64-${{ github.sha }}
+          path: tools/asb-proxy/out/
           if-no-files-found: error
