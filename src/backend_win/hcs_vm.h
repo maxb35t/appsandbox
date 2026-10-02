@@ -118,6 +118,16 @@ typedef struct {
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
     BOOL        relay_channel;           /* fork: ASB_RELAY_PORT channel enabled (persisted RelayChannel=1) */
+
+    /* fork: throwaway instances (asb_vm_create_instance). An instance runs on its own
+       differencing disk layered on one of its parent VM's snapshots, under its own HCS
+       name, alongside the parent and other instances. */
+    BOOL        ephemeral;               /* TRUE = instance of parent_name, not a user VM */
+    BOOL        auto_delete;             /* delete its disk and entry when it stops */
+    int         instance_snap;           /* parent snapshot it runs on (-2 = the base) */
+    wchar_t     parent_name[256];
+    volatile LONG deleting;              /* 1 once deletion has started (runs once) */
+    BOOL        dead;                    /* freed slot: skipped everywhere, reused by the next instance */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.
@@ -153,6 +163,11 @@ HRESULT hcs_resume_vm(VmInstance *instance);
 
 /* Save VM state to a file (memory + device state). */
 HRESULT hcs_save_vm(VmInstance *instance, const wchar_t *state_path);
+
+/* fork: grant / revoke a VM's access to a file (HcsGrantVmAccess / HcsRevokeVmAccess).
+   Revoke returns E_NOTIMPL if computecore.dll doesn't export it. */
+HRESULT hcs_grant_vm_access(const wchar_t *vm_name, const wchar_t *path);
+HRESULT hcs_revoke_vm_access(const wchar_t *vm_name, const wchar_t *path);
 
 /* Close the HCS handle (does not stop the VM).
    Uses a background thread to avoid blocking the UI. */

@@ -104,6 +104,15 @@ static void display_reap_stale(UINT64 vm_id)
     if (e && e->disp && !vm_display_idd_is_open(e->disp))
         display_drop(e);
 }
+/* fork: drop display windows whose VM is gone (an auto-deleted instance). */
+static void display_sweep_orphans(void)
+{
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; i++) {
+        if (g_displays[i].vm_id && !asb_find_vm_by_id(g_displays[i].vm_id))
+            display_drop(&g_displays[i]);
+    }
+}
 /* A-gate: can this process put a window on a visible desktop? FALSE in a service /
    non-interactive session, so we refuse instead of spawning an invisible window. */
 static BOOL host_can_show_window(void)
@@ -272,8 +281,15 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
-    pos += sprintf_s(out + pos, cap - pos, ",\"relayChannel\":%s}",
-                     v->relay_channel ? "true" : "false");   /* fork */
+    pos += sprintf_s(out + pos, cap - pos, ",\"relayChannel\":%s,\"ephemeral\":%s",
+                     v->relay_channel ? "true" : "false", v->ephemeral ? "true" : "false");   /* fork */
+    if (v->ephemeral) {
+        pos += sprintf_s(out + pos, cap - pos, ",\"parent\":");
+        pos  = append_wstr(out, cap, pos, v->parent_name);
+        pos += sprintf_s(out + pos, cap - pos, ",\"snapIndex\":%d,\"autoDelete\":%s",
+                         v->instance_snap, v->auto_delete ? "true" : "false");
+    }
+    pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
 
@@ -581,6 +597,25 @@ static int handle_request(PHTTP_REQUEST req)
         send_err(req->RequestId, 401, "Unauthorized", "unauthorized", "missing or bad bearer token");
         return 0;
     }
+    display_sweep_orphans();   /* fork */
+
+    /* ---- fork: daemon settings ---- */
+    if (wcscmp(path, L"/v1/settings") == 0) {
+        if (verb == HttpVerbPUT) {
+            wchar_t body[1024]; BOOL bv;
+            body_to_wide(req, body, 1024);
+            if (json_get_bool(body, L"instanceAutoDelete", &bv))
+                asb_set_instance_auto_delete(bv);
+        }
+        if (verb == HttpVerbGET || verb == HttpVerbPUT) {
+            sprintf_s(buf, sizeof(buf), "{\"instanceAutoDelete\":%s}",
+                      asb_get_instance_auto_delete() ? "true" : "false");
+            send_json(req->RequestId, 200, "OK", buf);
+            return 0;
+        }
+        send_err(req->RequestId, 405, "Method Not Allowed", "method", "unsupported method");
+        return 0;
+    }
 
     /* SSE event stream -- handed to a dedicated thread so it doesn't block the loop. */
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/events") == 0) {
@@ -631,7 +666,7 @@ static int handle_request(PHTTP_REQUEST req)
             pos = sprintf_s(buf, sizeof(buf), "{\"vms\":[");
             for (i = 0; i < count; i++) {
                 VmInstance *v = asb_vm_instance(asb_vm_get(i));
-                if (!v) continue;
+                if (!v || v->dead) continue;   /* fork: freed instance slot */
                 if (emitted++) pos += sprintf_s(buf + pos, sizeof(buf) - pos, ",");
                 pos = append_vm_json(buf, sizeof(buf), pos, v);
             }
@@ -892,6 +927,50 @@ static int handle_request(PHTTP_REQUEST req)
             send_hr(req->RequestId, "start", nu, asb_vm_start(vm, si, bi, bname[0] ? bname : NULL));
             return 0;
         }
+        /* fork: POST /v1/vms/{n}/instances {snapIndex, ramMb?, cpuCores?, autoDelete?}
+           creates and starts a throwaway instance; reply carries its name. */
+        if (verb == HttpVerbPOST && wcscmp(sub, L"instances") == 0) {
+            wchar_t body[1024], iname[256];
+            int snap = -1, iv; BOOL bv; DWORD ram = 0, cpu = 0; int ad = -1;
+            HRESULT ihr;
+            VmInstance *pv = asb_vm_instance(vm);
+            body_to_wide(req, body, 1024);
+            if (!json_get_int(body, L"snapIndex", &snap)) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "snapIndex required (-2 = the base)");
+                return 0;
+            }
+            if (json_get_int(body, L"ramMb", &iv)) {
+                if (iv < 512) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "RAM must be at least 512 MB"); return 0; }
+                ram = (DWORD)(iv - iv % 2);
+            }
+            if (json_get_int(body, L"cpuCores", &iv)) {
+                if (iv < 1) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "CPU cores must be at least 1"); return 0; }
+                cpu = (DWORD)iv;
+            }
+            if (json_get_bool(body, L"autoDelete", &bv)) ad = bv ? 1 : 0;
+            if (pv && (pv->ephemeral || pv->building_vhdx || !pv->install_complete)) {
+                send_err(req->RequestId, 409, "Conflict", "not_instantiable",
+                         "instances need an installed, non-instance VM");
+                return 0;
+            }
+            ihr = asb_vm_create_instance(vm, snap, ram, cpu, ad, iname, 256);
+            if (ihr == E_INVALIDARG) {
+                send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                         "snapIndex must be a snapshot index, or -2 for the base once snapshots exist");
+                return 0;
+            }
+            if (ihr == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS)) {
+                send_err(req->RequestId, 409, "Conflict", "no_capacity", "the VM list is full");
+                return 0;
+            }
+            if (FAILED(ihr)) { send_hr(req->RequestId, "createInstance", nu, ihr); return 0; }
+            pos = sprintf_s(buf, sizeof(buf), "{\"ok\":true,\"accepted\":true,\"action\":\"createInstance\",\"parent\":\"%s\",\"name\":", nu);
+            pos = append_wstr(buf, sizeof(buf), pos, iname);
+            sprintf_s(buf + pos, sizeof(buf) - pos, "}");
+            send_json(req->RequestId, 202, "Accepted", buf);
+            return 0;
+        }
+
         if (verb == HttpVerbPOST && wcscmp(sub, L"shutdown") == 0)
             { send_hr(req->RequestId, "shutdown", nu, asb_vm_shutdown(vm)); return 0; }
         if (verb == HttpVerbPOST && wcscmp(sub, L"stop") == 0)
@@ -908,7 +987,15 @@ static int handle_request(PHTTP_REQUEST req)
                 return 0;
             }
             if (dv) display_drop(display_find(dv->unique_id));   /* close its display window first */
-            send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
+            {
+                HRESULT dhr = asb_vm_delete(vm);
+                if (dhr == HRESULT_FROM_WIN32(ERROR_BUSY)) {   /* fork */
+                    send_err(req->RequestId, 409, "Conflict", "instances_running",
+                             "delete the running instances first");
+                    return 0;
+                }
+                send_hr(req->RequestId, "delete", nu, dhr);
+            }
             return 0;
         }
 
@@ -1095,6 +1182,11 @@ static int handle_request(PHTTP_REQUEST req)
                         if (dhr == HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY)) {   /* fork */
                             send_err(req->RequestId, 409, "Conflict", "snapshot_has_children",
                                      "other snapshots are built on this snapshot; delete them first");
+                            return 0;
+                        }
+                        if (dhr == HRESULT_FROM_WIN32(ERROR_BUSY)) {   /* fork */
+                            send_err(req->RequestId, 409, "Conflict", "instances_running",
+                                     "instances of this VM are running; delete them first");
                             return 0;
                         }
                         send_hr(req->RequestId, "snapDelete", nu, dhr);

@@ -169,8 +169,14 @@ static int g_template_count = 0;
 static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
 static BOOL g_suppress_tray_warn = FALSE;
 
+/* fork: default for instances created without an explicit autoDelete
+   ([Settings] InstanceAutoDelete=0|1; default 1). */
+static BOOL g_instance_auto_delete = TRUE;
+
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
+
+static BOOL remove_dir_recursive(const wchar_t *dir);   /* used by load_vm_list (fork) */
 
 /* ---- Callbacks ---- */
 
@@ -522,12 +528,14 @@ static void save_vm_list(void)
 
     if (_wfopen_s(&f, path, L"w,ccs=UTF-8") != 0 || !f) return;
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
+    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn || !g_instance_auto_delete) {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
         if (g_suppress_tray_warn)
             fwprintf(f, L"SuppressTrayWarn=1\n");
+        if (!g_instance_auto_delete)
+            fwprintf(f, L"InstanceAutoDelete=0\n");   /* fork */
         fwprintf(f, L"\n");
     }
 
@@ -541,8 +549,15 @@ static void save_vm_list(void)
 
     for (i = 0; i < g_vm_count; i++) {
         if (g_vms[i].building_vhdx) continue;
+        if (g_vms[i].dead) continue;   /* fork: freed instance slot */
         fwprintf(f, L"[VM]\n");
         fwprintf(f, L"Name=%s\n", g_vms[i].name);
+        if (g_vms[i].ephemeral) {
+            /* fork: recorded only so a crashed daemon's instances are cleaned up on the
+               next start (load_vm_list); instances never survive a restart. */
+            fwprintf(f, L"Ephemeral=1\n");
+            fwprintf(f, L"Parent=%s\n", g_vms[i].parent_name);
+        }
         fwprintf(f, L"OsType=%s\n", g_vms[i].os_type);
         fwprintf(f, L"ImagePath=%s\n", g_vms[i].image_path);
         fwprintf(f, L"VhdxPath=%s\n", g_vms[i].vhdx_path);
@@ -680,6 +695,8 @@ static void load_vm_list(void)
                 wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
+            else if (wcsncmp(line, L"InstanceAutoDelete=", 19) == 0)   /* fork */
+                g_instance_auto_delete = (_wtoi(line + 19) != 0);
             continue;
         }
 
@@ -731,6 +748,10 @@ static void load_vm_list(void)
             vm->ssh_deploy_key = (_wtoi(line + 13) != 0);
         else if (wcsncmp(line, L"RelayChannel=", 13) == 0)
             vm->relay_channel = (_wtoi(line + 13) != 0);
+        else if (wcsncmp(line, L"Ephemeral=", 10) == 0)
+            vm->ephemeral = (_wtoi(line + 10) != 0);
+        else if (wcsncmp(line, L"Parent=", 7) == 0)
+            wcsncpy_s(vm->parent_name, 256, line + 7, _TRUNCATE);
         else if (wcsncmp(line, L"SshPubKey=", 10) == 0)
             /* Truncating copy: wcscpy_s ABORTS the process on overflow, and this
                line comes from an editable config file. Generated ed25519 lines
@@ -741,6 +762,36 @@ static void load_vm_list(void)
     }
 
     fclose(f);
+
+    /* fork: instances never survive a daemon restart. Anything recorded here is a
+       leftover from a crash: terminate its compute system, delete its folder and drop
+       the entry before anything else looks at g_vms[]. Then sweep each VM's
+       instances\ folder for directories that never made it into vms.cfg. */
+    {
+        int i = 0, j;
+        while (i < g_vm_count) {
+            if (!g_vms[i].ephemeral) { i++; continue; }
+            {
+                wchar_t dir[MAX_PATH];
+                hcs_destroy_stale(g_vms[i].name);
+                if (get_vm_disk_root(g_vms[i].vhdx_path, dir))
+                    remove_dir_recursive(dir);
+                asb_log(L"Removed leftover instance \"%s\".", g_vms[i].name);
+            }
+            for (j = i; j < g_vm_count - 1; j++) g_vms[j] = g_vms[j + 1];
+            ZeroMemory(&g_vms[g_vm_count - 1], sizeof(VmInstance));
+            g_vm_count--;
+            gpu_changed = TRUE;   /* rewrite vms.cfg without them */
+        }
+        for (i = 0; i < g_vm_count; i++) {
+            wchar_t root[MAX_PATH], inst_dir[MAX_PATH];
+            if (!get_vm_disk_root(g_vms[i].vhdx_path, root)) continue;
+            if (wcslen(root) + 12 >= MAX_PATH) continue;
+            swprintf_s(inst_dir, MAX_PATH, L"%s\\instances", root);
+            if (GetFileAttributesW(inst_dir) != INVALID_FILE_ATTRIBUTES)
+                remove_dir_recursive(inst_dir);
+        }
+    }
 
     /* Initialize snapshot lists, reset runtime state, load per-VM state */
     {
@@ -870,6 +921,122 @@ static BOOL remove_dir_recursive(const wchar_t *dir)
     return RemoveDirectoryW(dir);
 }
 
+/* ---- fork: throwaway instances ----
+
+   An instance is a g_vms[] entry with ephemeral = TRUE. It runs on
+   <parent root>\instances\<name>\disk.vhdx, a differencing disk layered on one of the
+   parent's snapshot disks (or its frozen base), under its own HCS name, so it can run
+   at the same time as the parent and other instances.
+
+   Instance slots are never compacted while the daemon runs: HCS callback contexts,
+   SSH proxies and other threads hold VmInstance pointers, and shifting g_vms[] under
+   them would hand them another VM. A deleted instance's slot is zeroed and marked
+   dead instead. Dead slots are skipped everywhere and reused by the next instance. */
+
+static int live_instance_count(const wchar_t *parent_name)
+{
+    int i, n = 0;
+    for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].dead || !g_vms[i].ephemeral) continue;
+        if (!parent_name || _wcsicmp(g_vms[i].parent_name, parent_name) == 0) n++;
+    }
+    return n;
+}
+
+static int find_vm_index_by_name(const wchar_t *name)
+{
+    int i;
+    for (i = 0; i < g_vm_count; i++) {
+        if (!g_vms[i].dead && _wcsicmp(g_vms[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+/* The frozen disks an instance on parent snapshot `snap` reads through, from that
+   snapshot down to the base. Returns the number written to chain[]. */
+static int instance_disk_chain(int parent_idx, int snap, wchar_t chain[][MAX_PATH], int max)
+{
+    SnapshotTree *t = &g_snap_trees[parent_idx];
+    int n = 0, guard = 0;
+    while (snap >= 0 && snap < t->count && n < max && guard++ < MAX_SNAPSHOTS) {
+        wcscpy_s(chain[n++], MAX_PATH, t->nodes[snap].snap_vhdx);
+        snap = snapshot_parent_index(t, snap);
+    }
+    if (n < max && t->base_vhdx[0] != L'\0')
+        wcscpy_s(chain[n++], MAX_PATH, t->base_vhdx);
+    return n;
+}
+
+/* Grant (or revoke) the instance's HCS identity access to every frozen disk it reads
+   through, plus the ISOs the VM config attaches. HcsGrantVmAccess on the instance's
+   own disk happens in hcs_create_vm*; it's revoked here too before the folder is
+   deleted. */
+static void instance_set_access(VmInstance *inst, BOOL grant)
+{
+    wchar_t chain[MAX_SNAPSHOTS + 1][MAX_PATH];
+    int parent_idx = find_vm_index_by_name(inst->parent_name), n = 0, k;
+    if (parent_idx >= 0)
+        n = instance_disk_chain(parent_idx, inst->instance_snap, chain, MAX_SNAPSHOTS + 1);
+    for (k = 0; k < n; k++) {
+        HRESULT hr = grant ? hcs_grant_vm_access(inst->name, chain[k])
+                           : hcs_revoke_vm_access(inst->name, chain[k]);
+        if (FAILED(hr) && hr != E_NOTIMPL)
+            asb_log(L"Instance \"%s\": %s access on %s failed (0x%08X).",
+                    inst->name, grant ? L"grant" : L"revoke", chain[k], hr);
+    }
+    if (!grant) {
+        hcs_revoke_vm_access(inst->name, inst->vhdx_path);
+        if (inst->image_path[0]) hcs_revoke_vm_access(inst->name, inst->image_path);
+        if (inst->resources_iso_path[0]) hcs_revoke_vm_access(inst->name, inst->resources_iso_path);
+    }
+}
+
+/* Delete a stopped instance: wait for the VM worker to let go of its disk, revoke its
+   access, remove its folder and free its slot. The caller has already set
+   inst->deleting and stopped the agent, SSH proxy, monitor and IDD probe. */
+static HRESULT instance_destroy(VmInstance *inst)
+{
+    wchar_t dir[MAX_PATH], name[256];
+    AsbVm vm = vm_handle(inst);
+    int waited = 0;
+    HRESULT hr = S_OK;
+
+    wcscpy_s(name, 256, inst->name);
+    hcs_destroy_stale(name);
+    /* vmwp.exe may still hold the disk for a moment after the exit event. */
+    while (waited < 30000) {
+        HANDLE h = CreateFileW(inst->vhdx_path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); break; }
+        if (GetLastError() != ERROR_SHARING_VIOLATION) break;
+        Sleep(250); waited += 250;
+    }
+    instance_set_access(inst, FALSE);
+    if (get_vm_disk_root(inst->vhdx_path, dir) && !remove_dir_recursive(dir)) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        asb_log(L"Warning: instance \"%s\" folder not fully removed (0x%08X): %s", name, hr, dir);
+    }
+
+    if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+    EnterCriticalSection(&g_cs);
+    ZeroMemory(inst, sizeof(VmInstance));
+    inst->dead = TRUE;
+    LeaveCriticalSection(&g_cs);
+    save_vm_list();
+    asb_log(L"Instance \"%s\" deleted.", name);
+    return hr;
+}
+
+static DWORD WINAPI instance_delete_thread(LPVOID param)
+{
+    UINT64 id = *(UINT64 *)param;
+    VmInstance *inst;
+    free(param);
+    inst = asb_find_vm_by_id(id);
+    if (inst && inst->ephemeral && !inst->dead) instance_destroy(inst);
+    return 0;
+}
+
 /* ---- HCS state callback (called from HCS worker thread) ---- */
 
 static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
@@ -899,6 +1066,19 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 
             asb_vm_cleanup_network(instance);
             hcs_close_vm(instance);
+
+            /* fork: an auto-delete instance goes away once it stops. Deletion waits for
+               vmwp.exe to release the disk, so it runs on its own thread. */
+            if (instance->ephemeral && instance->auto_delete &&
+                InterlockedCompareExchange(&instance->deleting, 1, 0) == 0) {
+                UINT64 *id = (UINT64 *)malloc(sizeof(UINT64));
+                if (id) {
+                    *id = instance->unique_id;
+                    CloseHandle(CreateThread(NULL, 0, instance_delete_thread, id, 0, NULL));
+                } else {
+                    instance->deleting = 0;
+                }
+            }
 
             /* Template finalization */
             if (instance->is_template) {
@@ -3849,6 +4029,28 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     inst = &g_vms[idx];
+    if (inst->dead) return E_INVALIDARG;
+
+    /* fork: instances are torn down in place (their slot is freed, never compacted). */
+    if (inst->ephemeral) {
+        if (InterlockedCompareExchange(&inst->deleting, 1, 0) != 0)
+            return S_OK;   /* auto-delete already under way */
+        hcs_stop_monitor(inst);
+        vm_ssh_proxy_stop(inst);
+        vm_agent_stop(inst);
+        idd_probe_stop(inst);
+        if (inst->running) hcs_terminate_vm(inst);
+        asb_vm_cleanup_network(inst);
+        hcs_close_vm(inst);
+        return instance_destroy(inst);
+    }
+    /* fork: deleting a regular VM compacts g_vms[], which would move running instances
+       under the threads that hold pointers to them. Refuse while any instance exists. */
+    if (live_instance_count(NULL) > 0) {
+        asb_log(L"Delete the running instances before deleting a VM.");
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+
     if (!get_vm_disk_root(inst->vhdx_path, dir)) return E_INVALIDARG;
     attrs = GetFileAttributesW(dir);
     if (attrs == INVALID_FILE_ATTRIBUTES) {
@@ -3938,6 +4140,7 @@ ASB_API AsbVm asb_vm_find(const wchar_t *name)
     int i;
     if (!name) return NULL;
     for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].dead) continue;   /* fork: freed instance slot */
         if (_wcsicmp(g_vms[i].name, name) == 0)
             return vm_handle(&g_vms[i]);
     }
@@ -4130,6 +4333,130 @@ ASB_API BOOL asb_vm_relay_channel(AsbVm vm)
     return inst ? inst->relay_channel : FALSE;
 }
 
+/* ---- fork: throwaway instances ---- */
+
+ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
+                                       DWORD cpu_cores, int auto_delete,
+                                       wchar_t *out_name, size_t out_cap)
+{
+    int pidx = vm_index_of(parent), slot = -1, n, i;
+    VmInstance *p, *inst;
+    SnapshotTree *t;
+    const wchar_t *parent_disk;
+    wchar_t name[256], root[MAX_PATH], inst_dir[MAX_PATH], snap_dir[MAX_PATH], vhdx[MAX_PATH];
+    HRESULT hr;
+
+    if (out_name && out_cap) out_name[0] = L'\0';
+    if (pidx < 0) return E_INVALIDARG;
+    p = &g_vms[pidx];
+    t = &g_snap_trees[pidx];
+    if (p->dead || p->ephemeral || p->is_template || p->building_vhdx || !p->install_complete)
+        return E_NOT_VALID_STATE;
+
+    /* The disk to layer on must be frozen: a snapshot, or the base once snapshots exist. */
+    if (snap_idx >= 0 && snap_idx < t->count && t->nodes[snap_idx].valid)
+        parent_disk = t->nodes[snap_idx].snap_vhdx;
+    else if (snap_idx == -2 && t->base_vhdx[0] != L'\0' && (t->count > 0 || t->base_branch_count > 0))
+        parent_disk = t->base_vhdx;
+    else
+        return E_INVALIDARG;
+
+    if (!get_vm_disk_root(p->vhdx_path, root)) return E_INVALIDARG;
+
+    /* Name: <parent>-<n>, lowest n not in use. */
+    name[0] = L'\0';
+    for (n = 1; n < 1000; n++) {
+        swprintf_s(name, 256, L"%s-%d", p->name, n);
+        if (find_vm_index_by_name(name) < 0) break;
+    }
+    if (n >= 1000) return HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS);
+
+    if (wcslen(root) + wcslen(name) + 40 >= MAX_PATH) return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    swprintf_s(inst_dir, MAX_PATH, L"%s\\instances", root);
+    CreateDirectoryW(inst_dir, NULL);
+    swprintf_s(inst_dir, MAX_PATH, L"%s\\instances\\%s", root, name);
+    if (GetFileAttributesW(inst_dir) != INVALID_FILE_ATTRIBUTES)
+        remove_dir_recursive(inst_dir);   /* stale leftover of a reused name */
+    if (!CreateDirectoryW(inst_dir, NULL))
+        return HRESULT_FROM_WIN32(GetLastError());
+    swprintf_s(vhdx, MAX_PATH, L"%s\\disk.vhdx", inst_dir);
+    swprintf_s(snap_dir, MAX_PATH, L"%s\\snapshots", inst_dir);
+
+    hr = vhdx_create_differencing(vhdx, parent_disk);
+    if (FAILED(hr)) { remove_dir_recursive(inst_dir); return hr; }
+
+    EnterCriticalSection(&g_cs);
+    for (i = 0; i < g_vm_count; i++) {
+        if (g_vms[i].dead) { slot = i; break; }
+    }
+    if (slot < 0 && g_vm_count < ASB_MAX_VMS) slot = g_vm_count++;
+    if (slot < 0) {
+        LeaveCriticalSection(&g_cs);
+        remove_dir_recursive(inst_dir);
+        asb_log(L"Cannot create instance: the VM list is full (%d).", ASB_MAX_VMS);
+        return HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS);
+    }
+    inst = &g_vms[slot];
+    p = &g_vms[pidx];   /* unchanged (no compaction), re-read for clarity */
+    ZeroMemory(inst, sizeof(VmInstance));
+    inst->unique_id = g_next_vm_id++;
+    wcscpy_s(inst->name, 256, name);
+    wcscpy_s(inst->os_type, 32, p->os_type);
+    wcscpy_s(inst->vhdx_path, MAX_PATH, vhdx);
+    wcscpy_s(inst->image_path, MAX_PATH, p->image_path);
+    inst->ram_mb = ram_mb ? ram_mb : p->ram_mb;
+    inst->hdd_gb = p->hdd_gb;
+    inst->cpu_cores = cpu_cores ? cpu_cores : p->cpu_cores;
+    inst->gpu_mode = p->gpu_mode;
+    wcscpy_s(inst->gpu_name, 256, p->gpu_name);
+    wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), p->gpu_id);
+    inst->network_mode = p->network_mode;
+    wcscpy_s(inst->net_adapter, 256, p->net_adapter);
+    /* mac_address and nat_ip stay empty: each instance gets its own on start. */
+    wcscpy_s(inst->resources_iso_path, MAX_PATH, p->resources_iso_path);
+    inst->install_complete = TRUE;
+    inst->test_mode = p->test_mode;
+    wcscpy_s(inst->admin_user, 128, p->admin_user);
+    inst->ssh_enabled = p->ssh_enabled;
+    inst->ssh_deploy_key = p->ssh_deploy_key;
+    wcscpy_s(inst->ssh_pubkey, 512, p->ssh_pubkey);
+    inst->relay_channel = p->relay_channel;
+    inst->ephemeral = TRUE;
+    inst->auto_delete = (auto_delete < 0) ? g_instance_auto_delete : (auto_delete != 0);
+    inst->instance_snap = snap_idx;
+    wcscpy_s(inst->parent_name, 256, p->name);
+    snapshot_init(&g_snap_trees[slot], snap_dir);
+    LeaveCriticalSection(&g_cs);
+
+    instance_set_access(inst, TRUE);
+    save_vm_list();
+    asb_log(L"Instance \"%s\" created from \"%s\" (snapshot %d, auto-delete %s).",
+            name, p->name, snap_idx, inst->auto_delete ? L"on" : L"off");
+
+    hr = asb_vm_start(vm_handle(inst), -1, -1, NULL);
+    if (FAILED(hr)) {
+        asb_log(L"Error: instance \"%s\" failed to start (0x%08X); removing it.", name, hr);
+        asb_vm_delete(vm_handle(inst));
+        return hr;
+    }
+    if (out_name && out_cap) wcsncpy_s(out_name, out_cap, name, _TRUNCATE);
+    return S_OK;
+}
+
+ASB_API BOOL asb_vm_is_listed(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst && !inst->dead;
+}
+
+ASB_API BOOL asb_get_instance_auto_delete(void) { return g_instance_auto_delete; }
+
+ASB_API void asb_set_instance_auto_delete(BOOL enabled)
+{
+    g_instance_auto_delete = enabled ? TRUE : FALSE;
+    save_vm_list();
+}
+
 /* ---- Snapshots ---- */
 
 ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
@@ -4163,6 +4490,10 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (snap_idx < 0) { asb_log(L"Select a snapshot to delete."); return E_INVALIDARG; }
+    if (live_instance_count(g_vms[idx].name) > 0) {   /* fork: instances read through snapshots */
+        asb_alert(L"Instances of this VM are running. Delete them before deleting a snapshot.");
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
     hr = snapshot_delete(&g_snap_trees[idx], &g_vms[idx], snap_idx);
