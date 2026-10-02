@@ -1319,7 +1319,8 @@ static void on_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"createInstance") == 0) {
         /* fork: {vmIndex, snapIndex, ramMb?, cpuCores?, gpuMode?, networkMode?,
-                  autoDelete?, ttlMinutes?, fastStop?}; -1 / absent = inherit or default */
+                  autoDelete?, ttlMinutes?, fastStop?, proxyMode?, proxy rule fields?};
+                  -1 / absent = inherit or default */
         int vi, iv;
         BOOL bv;
         AsbInstanceOptions o;
@@ -1335,6 +1336,19 @@ static void on_webview2_message(const wchar_t *json)
             if (json_get_int(json, L"ttlMinutes", &iv) && iv >= 0) o.ttl_minutes = iv;
             if (json_get_bool(json, L"autoDelete", &bv)) o.auto_delete = bv ? 1 : 0;
             if (json_get_bool(json, L"fastStop", &bv)) o.fast_stop = bv ? 1 : 0;
+            {   /* fork: proxyMode "parent" (default) | "defaults" | "custom" + rule fields */
+                static AsbProxyPolicy ip;
+                wchar_t mode[16] = { 0 };
+                json_get_string(json, L"proxyMode", mode, 16);
+                if (wcscmp(mode, L"defaults") == 0) {
+                    ZeroMemory(&ip, sizeof(ip));
+                    o.proxy = &ip;
+                } else if (wcscmp(mode, L"custom") == 0 && asb_vm_get_proxy(asb_vm_get(vi), &ip)) {
+                    ip.custom = TRUE;
+                    read_proxy_fields(json, &ip);
+                    o.proxy = &ip;
+                }
+            }
             hr = asb_vm_create_instance_ex(asb_vm_get(vi), &o, iname, 256);
             if (FAILED(hr)) {
                 ui_log(L"Instance creation failed (0x%08X).", hr);

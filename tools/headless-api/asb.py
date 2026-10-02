@@ -167,7 +167,8 @@ class Client:
 
     # ---- maxb35t fork: throwaway instances + daemon settings ----
     def create_instance(self, name, snap_index, ram_mb=None, cpu_cores=None, auto_delete=None,
-                        gpu_mode=None, network_mode=None, ttl_minutes=None, fast_stop=None):
+                        gpu_mode=None, network_mode=None, ttl_minutes=None, fast_stop=None,
+                        proxy=None):
         """Create and start a throwaway instance of VM `name` layered on its snapshot
         `snap_index` (-2 = the frozen base). Returns (status, body); body["name"] is the
         instance's name (e.g. "AgentTest-1"). The instance is a normal VM for status,
@@ -175,7 +176,10 @@ class Client:
         None = the parent's value (ram_mb, cpu_cores, gpu_mode, network_mode) or the daemon
         default from settings() (auto_delete, ttl_minutes, fast_stop).
         gpu_mode 0 = no GPU; ttl_minutes forces it off after N minutes (0 = no limit);
-        fast_stop makes shutdown() force it off instead of a guest shutdown."""
+        fast_stop makes shutdown() force it off instead of a guest shutdown.
+        proxy (Proxied mode): None = the parent's rules; "defaults" = the global defaults;
+        or a dict of rules starting from the parent's, e.g. {"allow": "github.com", "ports": "443"}
+        (keys blockPrivate, ports, allow, deny, log)."""
         body = {"snapIndex": snap_index}
         if ram_mb is not None:       body["ramMb"] = int(ram_mb) - int(ram_mb) % 2
         if cpu_cores is not None:    body["cpuCores"] = int(cpu_cores)
@@ -184,6 +188,11 @@ class Client:
         if network_mode is not None: body["networkMode"] = int(network_mode)
         if ttl_minutes is not None:  body["ttlMinutes"] = int(ttl_minutes)
         if fast_stop is not None:    body["fastStop"] = bool(fast_stop)
+        if proxy == "defaults":
+            body["proxyCustom"] = False
+        elif proxy:
+            for k, v in proxy.items():
+                body["proxy" + k[0].upper() + k[1:]] = v
         return self._req("POST", "/vms/%s/instances" % name, body)
     def instances(self, name=None):
         """Live instances (status objects), optionally only those of parent VM `name`."""

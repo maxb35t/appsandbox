@@ -1065,7 +1065,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld && !vm.ephemeral, function() { openEditVmModal(i); }, '', vm.ephemeral ? 'Instances are configured when they are created' : 'Edit VM configuration — VM must be stopped'),
+        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld && !vm.ephemeral, function() { openEditVmModal(i); }, '', vm.ephemeral ? 'Instances are set up in New Instance when they are created and can\u2019t be edited. To change a Proxied instance\u2019s web rules while it runs, click Proxied in its Network column.' : 'Edit VM configuration — VM must be stopped'),
     );
     return cells;
 }
@@ -1234,8 +1234,39 @@ function openInstanceModal() {
     document.getElementById('inst-autodelete').checked = !!appSettings.instanceAutoDelete;
     document.getElementById('inst-faststop').checked = !!appSettings.instanceFastStop;
     document.getElementById('instance-warn').textContent = '';
+    /* fork: proxy rules, prefilled from the VM's */
+    var vp = vm.proxy || {};
+    document.getElementById('inst-proxy-parent').textContent = 'Same as ' + vm.name;
+    document.getElementById('inst-proxy-mode').value = 'parent';
+    document.getElementById('ip-private').checked = vp.blockPrivate !== false;
+    document.getElementById('ip-ports').value = vp.ports || '80,443';
+    document.getElementById('ip-allow').value = vp.allow || '';
+    document.getElementById('ip-deny').value = vp.deny || '';
+    document.getElementById('ip-log').checked = vp.log !== false;
+    updateInstanceProxy();
     document.getElementById('instance-overlay').classList.add('active');
     document.getElementById('btn-create-instance').focus();
+}
+
+/* fork: will the new instance be Proxied? (its own choice, or "Same as VM" on a Proxied VM) */
+function instanceProxied() {
+    if (!instanceModal) return false;
+    var net = document.getElementById('inst-net').value;
+    var vm = vms[vmIndexByName(instanceModal.name)];
+    return net === '4' || (net === '-1' && !!vm && vm.networkMode === 4);
+}
+
+function updateInstanceProxy() {
+    var show = instanceProxied();
+    var mode = document.getElementById('inst-proxy-mode').value;
+    var vm = instanceModal && vms[vmIndexByName(instanceModal.name)];
+    document.querySelectorAll('.inst-proxy').forEach(function(el) { el.style.display = show ? '' : 'none'; });
+    document.querySelectorAll('.inst-proxy-custom').forEach(function(el) {
+        el.style.display = show && mode === 'custom' ? '' : 'none';
+    });
+    document.getElementById('inst-proxy-summary').textContent =
+        mode === 'parent' && vm ? proxySummary(vm.proxy, true)
+        : mode === 'defaults' ? proxySummary(Object.assign({ custom: false }, appSettings.proxy || {}), true) : '';
 }
 
 function closeInstanceModal() {
@@ -1254,7 +1285,7 @@ function createInstance() {
     if (!(ram >= 512)) { warn.textContent = 'RAM must be at least 512 MB.'; return; }
     if (!(cpu >= 1)) { warn.textContent = 'CPU cores must be at least 1.'; return; }
     if (!(ttl >= 0)) { warn.textContent = 'Time limit must be 0 or more minutes.'; return; }
-    sendCmd('createInstance', {
+    var msg = {
         vmIndex: idx, snapIndex: instanceModal.snapIndex,
         ramMb: alignRamMb(ram), cpuCores: cpu,
         gpuMode: parseInt(document.getElementById('inst-gpu').value, 10),
@@ -1262,7 +1293,17 @@ function createInstance() {
         ttlMinutes: ttl,
         autoDelete: document.getElementById('inst-autodelete').checked,
         fastStop: document.getElementById('inst-faststop').checked
-    });
+    };
+    if (instanceProxied()) {
+        msg.proxyMode = document.getElementById('inst-proxy-mode').value;
+        if (msg.proxyMode === 'custom') {
+            var rules = proxyFormValues('ip-private', 'ip-ports', 'ip-allow', 'ip-deny', 'ip-log');
+            var perr = proxyPortsError(rules.ports);
+            if (perr) { warn.textContent = perr; return; }
+            Object.assign(msg, rules);
+        }
+    }
+    sendCmd('createInstance', msg);
     closeInstanceModal();
 }
 

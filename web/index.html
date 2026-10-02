@@ -291,7 +291,7 @@
 
                 <label for="inst-net">Network:</label>
                 <div class="form-row">
-                    <select id="inst-net">
+                    <select id="inst-net" onchange="updateInstanceProxy()">
                         <option value="-1">Same as VM</option>
                         <option value="0">None</option>
                         <option value="1">NAT</option>
@@ -300,6 +300,31 @@
                         <option value="4">Proxied (filtered web)</option>
                     </select>
                 </div>
+
+                <label for="inst-proxy-mode" class="inst-proxy">Proxy rules:</label>
+                <div class="form-row inst-proxy">
+                    <select id="inst-proxy-mode" onchange="updateInstanceProxy()">
+                        <option value="parent" id="inst-proxy-parent">Same as VM</option>
+                        <option value="defaults">Proxy defaults (Settings)</option>
+                        <option value="custom">Custom&hellip;</option>
+                    </select>
+                    <span class="host-info" id="inst-proxy-summary"></span>
+                </div>
+
+                <label for="ip-private" class="inst-proxy-custom">Block LAN:</label>
+                <div class="form-row inst-proxy-custom"><input type="checkbox" id="ip-private"> <span class="host-info">refuse private, LAN, host and loopback addresses</span></div>
+
+                <label for="ip-ports" class="inst-proxy-custom">Ports:</label>
+                <div class="form-row inst-proxy-custom"><input type="text" id="ip-ports" class="input-md" placeholder="80,443"></div>
+
+                <label for="ip-allow" class="inst-proxy-custom">Allow only:</label>
+                <div class="form-row inst-proxy-custom"><textarea id="ip-allow" rows="2" placeholder="empty = any site; e.g. github.com, crates.io"></textarea></div>
+
+                <label for="ip-deny" class="inst-proxy-custom">Block:</label>
+                <div class="form-row inst-proxy-custom"><textarea id="ip-deny" rows="2" placeholder="e.g. example.com (also blocks its subdomains)"></textarea></div>
+
+                <label for="ip-log" class="inst-proxy-custom">Log:</label>
+                <div class="form-row inst-proxy-custom"><input type="checkbox" id="ip-log"> <span class="host-info">record connections (Proxy activity)</span></div>
 
                 <label for="inst-ttl">Time limit:</label>
                 <div class="form-row"><input type="number" id="inst-ttl" min="0" class="input-sm"> minutes <span class="host-info">0 = no limit</span></div>

@@ -187,6 +187,8 @@ static wchar_t g_proxy_deny[1024] = L"";
 static BOOL    g_proxy_log = TRUE;
 
 static void proxy_refresh(void);   /* writes the proxy policy file (defined below) */
+static BOOL proxy_ports_valid(const wchar_t *p);                          /* fork, below */
+static HRESULT proxy_validate(const AsbProxyPolicy *p, AsbProxyPolicy *clean); /* fork, below */
 
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
@@ -4493,6 +4495,7 @@ ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions
     snap_idx = opt->snap_idx;
     if (opt->gpu_mode < -1 || opt->gpu_mode > GPU_DEFAULT) return E_INVALIDARG;
     if (opt->network_mode < -1 || opt->network_mode > NET_PROXIED) return E_INVALIDARG;
+    if (opt->proxy && opt->proxy->custom && !proxy_ports_valid(opt->proxy->ports)) return E_INVALIDARG;
     p = &g_vms[pidx];
     t = &g_snap_trees[pidx];
     if (p->dead || p->ephemeral || p->is_template || p->building_vhdx || !p->install_complete)
@@ -4574,6 +4577,18 @@ ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions
     wcscpy_s(inst->proxy_allow, 1024, p->proxy_allow);
     wcscpy_s(inst->proxy_deny, 1024, p->proxy_deny);
     inst->proxy_log = p->proxy_log;
+    if (opt->proxy) {   /* fork: the instance's own rules (validated above) */
+        AsbProxyPolicy c;
+        if (!opt->proxy->custom) inst->proxy_custom = FALSE;
+        else if (SUCCEEDED(proxy_validate(opt->proxy, &c))) {
+            inst->proxy_custom = TRUE;
+            inst->proxy_block_private = c.block_private;
+            wcscpy_s(inst->proxy_ports, 128, c.ports);
+            wcscpy_s(inst->proxy_allow, 1024, c.allow);
+            wcscpy_s(inst->proxy_deny, 1024, c.deny);
+            inst->proxy_log = c.log;
+        }
+    }
     inst->ephemeral = TRUE;
     inst->auto_delete = (opt->auto_delete < 0) ? g_instance_auto_delete : (opt->auto_delete != 0);
     inst->fast_stop = (opt->fast_stop < 0) ? g_instance_fast_stop : (opt->fast_stop != 0);
