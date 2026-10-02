@@ -233,6 +233,23 @@ rename / delete them the same way: `start(name, snap_index=-2, branch_name=...)`
 The base itself is **not** a deletable snapshot — `snap_delete(name, -2)` is
 refused (deleting the base disk is "delete the VM"); only its branches delete.
 
+### Throwaway instances *(maxb35t fork)*
+
+An **instance** is a short-lived copy of a VM. It runs on its own copy-on-write disk on top of one of the VM's snapshots, under its own name, **at the same time** as the VM itself and any other instances.
+
+| Method | Effect |
+|---|---|
+| `create_instance(name, snap_index, ram_mb=None, cpu_cores=None, auto_delete=None)` | Creates and starts an instance on snapshot `snap_index` (`-2` = the base, once snapshots exist). Returns `(202, {"name": "<vm>-<n>", ...})`. RAM and CPU default to the parent VM's. |
+| `instances(name=None)` | Live instances, optionally only those of VM `name`. |
+| `delete_vm(instance)` | Forces the instance off and deletes it. |
+| `settings()` / `set_settings(instanceAutoDelete=bool)` | Default for `auto_delete` (on unless changed; stored in `vms.cfg`). |
+
+- **Using an instance:** use it like any VM: `status`, `wait`, `ssh_info`, `open_display`, `shutdown`/`stop`. Its status object adds `ephemeral: true`, `parent`, `snapIndex` and `autoDelete`.
+- **Deletion:** with `auto_delete` on, the instance's disk, folder and entry are deleted as soon as it stops. With it off, it stays (stopped) until `delete_vm`.
+- **Daemon restarts:** instances never survive one. Any left after a crash are cleaned up on the next start.
+- **What instances share:** the parent's settings (GPU, network mode, SSH key, `relayChannel`) and its guest image, so the guest's hostname is the same in every instance.
+- **What's refused while a VM has instances:** deleting its snapshots, and deleting any regular VM. Both return 409 `instances_running`.
+
 ### Events (SSE)
 `events()` is a generator yielding parsed dicts as the daemon pushes them. It
 **blocks** — run it in a thread. Event shapes:

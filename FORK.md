@@ -33,4 +33,4 @@ To roll back, restore the two backed-up files.
 | Fork version tag and CI build | done |
 | Dedicated relay channel: Hyper-V socket port 8, per VM, `relayChannel` (off by default) | done |
 | Chained snapshots: snapshot the current branch; snapshots report `parent`; deleting a snapshot with children is refused (409) | done |
-| Throwaway concurrent instances from a snapshot | planned |
+| Throwaway instances: several at once from one snapshot, auto-delete on stop (switchable per instance and globally) | done |

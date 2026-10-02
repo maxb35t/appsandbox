@@ -201,6 +201,22 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
 ASB_API HRESULT asb_vm_set_relay_channel(AsbVm vm, BOOL enabled);
 ASB_API BOOL    asb_vm_relay_channel(AsbVm vm);
 
+/* ---- fork: throwaway instances ----
+   Create and start an instance of `parent` layered on its snapshot `snap_idx` (or -2 for
+   the frozen base). It runs under its own name (<parent>-<n>, returned in out_name)
+   alongside the parent and other instances. ram_mb/cpu_cores 0 = the parent's.
+   auto_delete: 1 = delete when it stops, 0 = keep until asb_vm_delete, -1 = the global
+   default (asb_get_instance_auto_delete). Instances never survive a daemon restart.
+   While a VM has instances, its snapshots can't be deleted, and no regular VM can be
+   deleted (ERROR_BUSY). */
+ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
+                                       DWORD cpu_cores, int auto_delete,
+                                       wchar_t *out_name, size_t out_cap);
+/* FALSE for a freed instance slot (asb_vm_get can return one; skip it). */
+ASB_API BOOL    asb_vm_is_listed(AsbVm vm);
+ASB_API BOOL    asb_get_instance_auto_delete(void);
+ASB_API void    asb_set_instance_auto_delete(BOOL enabled);
+
 /* ---- Snapshots ---- */
 
 ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name);

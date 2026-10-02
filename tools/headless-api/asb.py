@@ -165,6 +165,26 @@ class Client:
     def snap_delete_branch(self, name, index, branch_index):
         return self._req("DELETE", "/vms/%s/snapshots/%d/branches/%d" % (name, index, branch_index))
 
+    # ---- maxb35t fork: throwaway instances + daemon settings ----
+    def create_instance(self, name, snap_index, ram_mb=None, cpu_cores=None, auto_delete=None):
+        """Create and start a throwaway instance of VM `name` layered on its snapshot
+        `snap_index` (-2 = the frozen base). Returns (status, body); body["name"] is the
+        instance's name (e.g. "AgentTest-1"). The instance is a normal VM for status,
+        ssh_info, displays, shutdown/stop and delete_vm. auto_delete None = the daemon
+        default (settings()["instanceAutoDelete"]); True deletes it once it stops."""
+        body = {"snapIndex": snap_index}
+        if ram_mb is not None:      body["ramMb"] = int(ram_mb) - int(ram_mb) % 2
+        if cpu_cores is not None:   body["cpuCores"] = int(cpu_cores)
+        if auto_delete is not None: body["autoDelete"] = bool(auto_delete)
+        return self._req("POST", "/vms/%s/instances" % name, body)
+    def instances(self, name=None):
+        """Live instances (status objects), optionally only those of parent VM `name`."""
+        return [v for v in self.list() if v.get("ephemeral") and (name is None or v.get("parent") == name)]
+    def settings(self):          return self._req("GET", "/settings")[1]
+    def set_settings(self, **kw):
+        """e.g. set_settings(instanceAutoDelete=False)."""
+        return self._req("PUT", "/settings", kw)
+
     def shutdown_daemon(self, force=False):
         # Refused (409) while VMs run unless force=True (which terminates them).
         return self._req("POST", "/shutdown", {"force": True} if force else {})

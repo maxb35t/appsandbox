@@ -115,6 +115,7 @@ static PFN_HcsGetComputeSystemProperties pfnGetProps;
 static PFN_HcsModifyComputeSystem      pfnModify;
 static PFN_HcsOpenComputeSystem        pfnOpen;
 static PFN_HcsGrantVmAccess           pfnGrantAccess;
+static PFN_HcsGrantVmAccess           pfnRevokeAccess;   /* fork: same signature */
 static PFN_HcsCreateEmptyGuestStateFile   pfnCreateVmgs;
 static PFN_HcsCreateEmptyRuntimeStateFile pfnCreateVmrs;
 static PFN_HcsEnumerateComputeSystems     pfnEnumSystems;
@@ -679,6 +680,7 @@ BOOL hcs_init(void)
     pfnModify    = (PFN_HcsModifyComputeSystem)GetProcAddress(g_hcs_dll, "HcsModifyComputeSystem");
     pfnOpen      = (PFN_HcsOpenComputeSystem)GetProcAddress(g_hcs_dll, "HcsOpenComputeSystem");
     pfnGrantAccess = (PFN_HcsGrantVmAccess)GetProcAddress(g_hcs_dll, "HcsGrantVmAccess");
+    pfnRevokeAccess = (PFN_HcsGrantVmAccess)GetProcAddress(g_hcs_dll, "HcsRevokeVmAccess");
     pfnCreateVmgs  = (PFN_HcsCreateEmptyGuestStateFile)GetProcAddress(g_hcs_dll, "HcsCreateEmptyGuestStateFile");
     pfnCreateVmrs  = (PFN_HcsCreateEmptyRuntimeStateFile)GetProcAddress(g_hcs_dll, "HcsCreateEmptyRuntimeStateFile");
     pfnEnumSystems = (PFN_HcsEnumerateComputeSystems)GetProcAddress(g_hcs_dll, "HcsEnumerateComputeSystems");
@@ -1611,6 +1613,20 @@ static DWORD WINAPI close_vm_thread(LPVOID param)
     /* Callback already unregistered by hcs_close_vm before this thread starts */
     pfnClose(h);
     return 0;
+}
+
+HRESULT hcs_grant_vm_access(const wchar_t *vm_name, const wchar_t *path)
+{
+    if (!pfnGrantAccess) return E_NOTIMPL;
+    if (!vm_name || !path || !path[0]) return E_INVALIDARG;
+    return pfnGrantAccess(vm_name, path);
+}
+
+HRESULT hcs_revoke_vm_access(const wchar_t *vm_name, const wchar_t *path)
+{
+    if (!pfnRevokeAccess) return E_NOTIMPL;
+    if (!vm_name || !path || !path[0]) return E_INVALIDARG;
+    return pfnRevokeAccess(vm_name, path);
 }
 
 void hcs_close_vm(VmInstance *instance)
