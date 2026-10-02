@@ -277,6 +277,34 @@ static const char *derive_state(VmInstance *v)
     return "online";
 }
 
+/* fork: {"custom":..,"blockPrivate":..,"ports":"..","allow":"..","deny":"..","log":..} */
+static int append_proxy_json(char *out, int cap, int pos, const AsbProxyPolicy *p, BOOL with_custom)
+{
+    pos += sprintf_s(out + pos, cap - pos, "{");
+    if (with_custom) pos += sprintf_s(out + pos, cap - pos, "\"custom\":%s,", p->custom ? "true" : "false");
+    pos += sprintf_s(out + pos, cap - pos, "\"blockPrivate\":%s,\"ports\":", p->block_private ? "true" : "false");
+    pos  = append_wstr(out, cap, pos, p->ports);
+    pos += sprintf_s(out + pos, cap - pos, ",\"allow\":");
+    pos  = append_wstr(out, cap, pos, p->allow);
+    pos += sprintf_s(out + pos, cap - pos, ",\"deny\":");
+    pos  = append_wstr(out, cap, pos, p->deny);
+    pos += sprintf_s(out + pos, cap - pos, ",\"log\":%s}", p->log ? "true" : "false");
+    return pos;
+}
+
+/* fork: fill a policy from a JSON body, starting from `base`; returns FALSE on a bad field. */
+static BOOL read_proxy_body(const wchar_t *body, AsbProxyPolicy *p)
+{
+    BOOL bv;
+    wchar_t tmp[1024];
+    if (json_get_bool(body, L"blockPrivate", &bv)) p->block_private = bv;
+    if (json_get_bool(body, L"log", &bv)) p->log = bv;
+    if (json_get_string(body, L"ports", tmp, 128)) wcscpy_s(p->ports, 128, tmp);
+    if (json_get_string(body, L"allow", tmp, 1024)) wcscpy_s(p->allow, 1024, tmp);
+    if (json_get_string(body, L"deny", tmp, 1024)) wcscpy_s(p->deny, 1024, tmp);
+    return TRUE;
+}
+
 /* Cheap per-VM status object (no disk I/O -- snapshot tree is a separate route). */
 static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
 {
@@ -626,11 +654,38 @@ static int handle_request(PHTTP_REQUEST req)
     }
     display_sweep_orphans();   /* fork */
 
+    /* ---- fork: proxy connection log: GET /v1/proxy/log?vm=NAME&limit=N ---- */
+    if (verb == HttpVerbGET && wcscmp(path, L"/v1/proxy/log") == 0) {
+        wchar_t vmq[256] = { 0 };
+        int limit = 100, n;
+        static char logbuf[1024 * 1024];
+        const wchar_t *q = req->CookedUrl.pQueryString;
+        if (q) {
+            const wchar_t *v = wcsstr(q, L"vm="), *l = wcsstr(q, L"limit=");
+            if (v) {
+                size_t k = 0;
+                for (v += 3; *v && *v != L'&' && k + 1 < 256; v++) vmq[k++] = *v;
+                vmq[k] = 0;
+            }
+            if (l) limit = _wtoi(l + 6);
+        }
+        n = asb_proxy_read_log(vmq[0] ? vmq : NULL, limit, logbuf + 64, sizeof(logbuf) - 128);
+        {   /* wrap as {"count":n,"entries":[...]} in place */
+            char head[64];
+            int hl = sprintf_s(head, sizeof(head), "{\"count\":%d,\"entries\":", n);
+            char *start = logbuf + 64 - hl;
+            memcpy(start, head, hl);
+            strcat_s(start, sizeof(logbuf) - (start - logbuf), "}");
+            send_json(req->RequestId, 200, "OK", start);
+        }
+        return 0;
+    }
+
     /* ---- fork: daemon settings ---- */
     if (wcscmp(path, L"/v1/settings") == 0) {
         if (verb == HttpVerbPUT) {
-            wchar_t body[1024]; BOOL bv; int iv;
-            body_to_wide(req, body, 1024);
+            static wchar_t body[8192]; BOOL bv; int iv;
+            body_to_wide(req, body, 8192);
             if (json_get_bool(body, L"instanceAutoDelete", &bv))
                 asb_set_instance_auto_delete(bv);
             if (json_get_int(body, L"instanceTtlMinutes", &iv)) {
@@ -639,13 +694,30 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (json_get_bool(body, L"instanceFastStop", &bv))
                 asb_set_instance_fast_stop(bv);
+            if (json_has_key(body, L"proxy")) {   /* fork: {"proxy":{blockPrivate,ports,allow,deny,log}} */
+                AsbProxyPolicy d;
+                asb_get_proxy_defaults(&d);
+                read_proxy_body(body, &d);
+                d.custom = TRUE;
+                if (FAILED(asb_set_proxy_defaults(&d))) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "proxy.ports must be a comma list of 1-65535");
+                    return 0;
+                }
+            }
         }
         if (verb == HttpVerbGET || verb == HttpVerbPUT) {
-            sprintf_s(buf, sizeof(buf),
-                      "{\"instanceAutoDelete\":%s,\"instanceTtlMinutes\":%d,\"instanceFastStop\":%s}",
+            AsbProxyPolicy d;
+            int p2;
+            asb_get_proxy_defaults(&d);
+            p2 = sprintf_s(buf, sizeof(buf),
+                      "{\"instanceAutoDelete\":%s,\"instanceTtlMinutes\":%d,\"instanceFastStop\":%s,"
+                      "\"proxyServiceRunning\":%s,\"proxy\":",
                       asb_get_instance_auto_delete() ? "true" : "false",
                       asb_get_instance_ttl_minutes(),
-                      asb_get_instance_fast_stop() ? "true" : "false");
+                      asb_get_instance_fast_stop() ? "true" : "false",
+                      asb_proxy_service_running() ? "true" : "false");
+            p2 = append_proxy_json(buf, sizeof(buf), p2, &d, FALSE);
+            sprintf_s(buf + p2, sizeof(buf) - p2, "}");
             send_json(req->RequestId, 200, "OK", buf);
             return 0;
         }
@@ -928,7 +1000,7 @@ static int handle_request(PHTTP_REQUEST req)
                     }
                 }
                 if (json_get_int(body, L"networkMode", &iv)) {
-                    if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
+                    if (iv < 0 || iv > 4) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), 3 (Internal) or 4 (Proxied)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
                 }
                 {   /* fork: optional relay channel (ASB_RELAY_PORT) */
@@ -992,7 +1064,7 @@ static int handle_request(PHTTP_REQUEST req)
                 o.gpu_mode = iv;
             }
             if (json_get_int(body, L"networkMode", &iv)) {
-                if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0-3"); return 0; }
+                if (iv < 0 || iv > 4) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0-4 (4 = Proxied)"); return 0; }
                 o.network_mode = iv;
             }
             if (json_get_int(body, L"ttlMinutes", &iv)) {
@@ -1049,6 +1121,29 @@ static int handle_request(PHTTP_REQUEST req)
                 }
                 send_hr(req->RequestId, "delete", nu, dhr);
             }
+            return 0;
+        }
+
+        /* fork: GET/PUT /v1/vms/{n}/proxy -- rules used when networkMode is 4 (Proxied).
+           PUT {"custom":false} returns the VM to the global defaults; otherwise the given
+           fields are applied on top of the current rules (allowed while running). */
+        if (wcscmp(sub, L"proxy") == 0 && (verb == HttpVerbGET || verb == HttpVerbPUT)) {
+            AsbProxyPolicy p;
+            if (!asb_vm_get_proxy(vm, &p)) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
+            if (verb == HttpVerbPUT) {
+                wchar_t body[4096]; BOOL bv;
+                body_to_wide(req, body, 4096);
+                p.custom = TRUE;
+                if (json_get_bool(body, L"custom", &bv) && !bv) p.custom = FALSE;
+                else read_proxy_body(body, &p);
+                if (FAILED(asb_vm_set_proxy(vm, &p))) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "ports must be a comma list of 1-65535");
+                    return 0;
+                }
+                asb_vm_get_proxy(vm, &p);
+            }
+            pos = append_proxy_json(buf, sizeof(buf), 0, &p, TRUE);
+            send_json(req->RequestId, 200, "OK", buf);
             return 0;
         }
 

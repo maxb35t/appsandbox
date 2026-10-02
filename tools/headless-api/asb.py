@@ -189,6 +189,20 @@ class Client:
         """Live instances (status objects), optionally only those of parent VM `name`."""
         return [v for v in self.list() if v.get("ephemeral") and (name is None or v.get("parent") == name)]
     def settings(self):          return self._req("GET", "/settings")[1]
+    # ---- maxb35t fork: Proxied network mode (networkMode 4) ----
+    def proxy_policy(self, name):
+        """Effective proxy rules of VM `name`: {custom, blockPrivate, ports, allow, deny, log}."""
+        return self._req("GET", "/vms/%s/proxy" % name)[1]
+    def set_proxy_policy(self, name, **kw):
+        """Change VM `name`'s proxy rules (applies to a running VM within ~2 s), e.g.
+        set_proxy_policy("AgentTest", allow="github.com, crates.io", ports="443").
+        set_proxy_policy(name, custom=False) returns it to the global defaults, which are
+        changed with set_settings(proxy={...})."""
+        return self._req("PUT", "/vms/%s/proxy" % name, kw)
+    def proxy_log(self, vm=None, limit=100):
+        """Recent proxy connections (newest last), optionally for one VM name."""
+        q = "?limit=%d" % int(limit) + ("&vm=%s" % vm if vm else "")
+        return self._req("GET", "/proxy/log" + q)[1].get("entries", [])
     def set_settings(self, **kw):
         """e.g. set_settings(instanceAutoDelete=False, instanceTtlMinutes=120, instanceFastStop=True)."""
         return self._req("PUT", "/settings", kw)

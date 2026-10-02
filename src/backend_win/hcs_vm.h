@@ -26,6 +26,9 @@ typedef void *HCS_OPERATION;
 #define NET_NAT      1
 #define NET_EXTERNAL 2
 #define NET_INTERNAL 3
+/* maxb35t fork: no network adapter; web access only through the AppSandboxProxy service
+   (tools/asb-proxy) over Hyper-V socket channel ASB_RELAY_PORT, filtered per VM. */
+#define NET_PROXIED  4
 
 /* maxb35t fork: optional extra Hyper-V socket channel a user relay can use in either
    direction (e.g. a guest->host proxy relay). Port 7 is the SSH channel, so 8 is the
@@ -132,6 +135,14 @@ typedef struct {
     ULONGLONG   expires_at;              /* fork: unix time the limit hits (0 = none) */
     volatile LONG ttl_fired;             /* fork: 1 once the limit has stopped it */
     BOOL        fast_stop;               /* fork: shutdown = force off (throwaway disk) */
+
+    /* fork: proxy rules for NET_PROXIED (proxy_custom FALSE = use the global defaults) */
+    BOOL        proxy_custom;
+    BOOL        proxy_block_private;
+    wchar_t     proxy_ports[128];        /* "80,443" */
+    wchar_t     proxy_allow[1024];       /* comma list; empty = any host */
+    wchar_t     proxy_deny[1024];
+    BOOL        proxy_log;
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

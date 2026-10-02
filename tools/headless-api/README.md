@@ -253,6 +253,32 @@ An **instance** is a short-lived copy of a VM. It runs on its own copy-on-write 
 - **What instances share:** the parent's settings (GPU, network mode, SSH key, `relayChannel`) and its guest image, so the guest's hostname is the same in every instance.
 - **What's refused while a VM has instances:** deleting its snapshots, and deleting any regular VM. Both return 409 `instances_running`.
 
+### Proxied network mode *(maxb35t fork)*
+
+`networkMode: 4` (**Proxied**) gives a VM **no network adapter**. Its only route out is App Sandbox's
+filtering proxy, the `AppSandboxProxy` Windows service (`asb-proxy.exe`, running as LocalService).
+VM traffic reaches it over Hyper-V socket channel 8.
+
+**Starting a Proxied VM:**
+- App Sandbox installs or updates the service, starts it, and writes the VM's rules (keyed by the VM's runtime id).
+- Inside the VM, apps use `asb-proxy guest` on `127.0.0.1:3128` as their HTTP/HTTPS proxy. The guest relay has to be installed in the image once (see `tools/asb-proxy`).
+
+**Rules:** set per VM, or the global defaults. Instances inherit their parent's rules.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `blockPrivate` | `true` | Refuse LAN, host, loopback, link-local, multicast and reserved addresses (checked after DNS). |
+| `ports` | `"80,443"` | Allowed destination ports. |
+| `allow` | `""` | Comma list of host names; empty = any. A name matches itself and its subdomains. |
+| `deny` | `""` | Comma list of host names; wins over `allow`. |
+| `log` | `true` | Log each connection. |
+
+| Method | Effect |
+|---|---|
+| `proxy_policy(name)` / `set_proxy_policy(name, **fields)` | Read or change a VM's rules. `custom=False` returns it to the defaults. Changes apply within about 2 s, even while the VM runs. |
+| `settings()["proxy"]` / `set_settings(proxy={...})` | The global defaults. `settings()["proxyServiceRunning"]` shows whether the service is running. |
+| `proxy_log(vm=None, limit=100)` | Recent connections: time, VM, method, host, port, IP, result (`ok`, `denied:...`, `error:...`), bytes in each direction, duration. |
+
 ### Events (SSE)
 `events()` is a generator yielding parsed dicts as the daemon pushes them. It
 **blocks** — run it in a thread. Event shapes:
