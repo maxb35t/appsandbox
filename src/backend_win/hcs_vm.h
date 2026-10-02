@@ -27,6 +27,11 @@ typedef void *HCS_OPERATION;
 #define NET_EXTERNAL 2
 #define NET_INTERNAL 3
 
+/* maxb35t fork: optional extra Hyper-V socket channel a user relay can use in either
+   direction (e.g. a guest->host proxy relay). Port 7 is the SSH channel, so 8 is the
+   first free one. Enabled per VM (VmInstance.relay_channel); off by default. */
+#define ASB_RELAY_PORT 8
+
 /* Configuration for creating a new VM */
 typedef struct {
     wchar_t name[256];
@@ -48,6 +53,7 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    BOOL    relay_channel;           /* fork: also list ASB_RELAY_PORT in the HvSocket ServiceTable */
 } VmConfig;
 
 /* Runtime state of a VM */
@@ -111,6 +117,7 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    BOOL        relay_channel;           /* fork: ASB_RELAY_PORT channel enabled (persisted RelayChannel=1) */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

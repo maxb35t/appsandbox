@@ -123,7 +123,8 @@ class Client:
 
     def edit(self, name, **fields):
         """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
-        (same ranges as create); name is fixed at create and any other key is ignored.
+        (same ranges as create) and, on the maxb35t fork, relayChannel (bool); name is
+        fixed at create and any other key is ignored.
         Returns (status, body) -- 409 if the VM is running."""
         if isinstance(fields.get("ramMb"), int):
             fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI

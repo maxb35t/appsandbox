@@ -196,6 +196,9 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+/* fork: optional ASB_RELAY_PORT HvSocket channel (see hcs_vm.h). */
+ASB_API HRESULT asb_vm_set_relay_channel(AsbVm vm, BOOL enabled);
+ASB_API BOOL    asb_vm_relay_channel(AsbVm vm);
 
 /* ---- Snapshots ---- */
 

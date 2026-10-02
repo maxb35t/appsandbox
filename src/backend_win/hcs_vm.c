@@ -1116,8 +1116,12 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         wchar_t guid_str[64];
         unsigned port;
         service_table[0] = L'\0';
-        for (port = 1; port <= 6; port++) {
-            hcs_service_guid_str(config->os_type, port, guid_str, 64);
+        for (port = 1; port <= 7; port++) {
+            /* fork: slot 7 stands for ASB_RELAY_PORT (port 7 itself is SSH, which
+               the guest only binds, so it never needed listing). */
+            unsigned svc = (port == 7) ? ASB_RELAY_PORT : port;
+            if (port == 7 && !config->relay_channel) break;
+            hcs_service_guid_str(config->os_type, svc, guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"
                     L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","

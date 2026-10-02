@@ -30,6 +30,6 @@ To roll back, restore the two backed-up files.
 | Change | Status |
 |---|---|
 | Fork version tag and CI build | done |
-| Dedicated guest→host channel for user relays | planned |
+| Dedicated relay channel: Hyper-V socket port 8, per VM, `relayChannel` (off by default) | done |
 | Chained snapshots (snapshot the current branch) | planned |
 | Throwaway concurrent instances from a snapshot | planned |
