@@ -1288,7 +1288,9 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         instance->cpu_cores = config->cpu_cores;
         instance->gpu_mode = config->gpu_mode;
         wcscpy_s(instance->gpu_id, 512, config->gpu_id);
-        instance->network_mode = config->network_mode;
+        /* fork: a Proxied VM is created with no adapter (NET_NONE); keep its mode. */
+        if (!(instance->network_mode == NET_PROXIED && config->network_mode == NET_NONE))
+            instance->network_mode = config->network_mode;
         instance->is_template = config->is_template;
         instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
@@ -1381,7 +1383,9 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         instance->cpu_cores = config->cpu_cores;
         instance->gpu_mode = config->gpu_mode;
         wcscpy_s(instance->gpu_id, 512, config->gpu_id);
-        instance->network_mode = config->network_mode;
+        /* fork: a Proxied VM is created with no adapter (NET_NONE); keep its mode. */
+        if (!(instance->network_mode == NET_PROXIED && config->network_mode == NET_NONE))
+            instance->network_mode = config->network_mode;
         instance->is_template = config->is_template;
         instance->test_mode = config->test_mode;
         wcscpy_s(instance->admin_user, 128, config->admin_user);
