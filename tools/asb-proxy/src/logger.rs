@@ -1,5 +1,7 @@
-//! One JSON object per line per connection, in <log dir>/proxy.log, rotated to
-//! proxy.log.1 at 10 MB. Readers (App Sandbox's API and GUI) tail this file.
+//! JSON lines in <log dir>/proxy.log, rotated to proxy.log.1 at 10 MB. Readers (App
+//! Sandbox's API and GUI) tail this file. A connection that gets through writes an
+//! "open" line as soon as it is connected and a "close" line (bytes, duration) when it
+//! ends; a refused or failed one writes only "close". Lines of one connection share "id".
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -15,6 +17,8 @@ pub struct Logger {
 }
 
 pub struct Entry<'a> {
+    pub id: u64,
+    pub phase: &'a str,
     pub vm: &'a str,
     pub vm_id: &'a str,
     pub method: &'a str,
@@ -66,8 +70,8 @@ impl Logger {
 
     pub fn line(e: &Entry) -> String {
         format!(
-            "{{\"t\":\"{}\",\"vm\":{},\"vmId\":{},\"method\":{},\"host\":{},\"port\":{},\"ip\":{},\"result\":{},\"up\":{},\"down\":{},\"ms\":{}}}\n",
-            utc_now(), json_str(e.vm), json_str(e.vm_id), json_str(e.method), json_str(e.host), e.port,
+            "{{\"t\":\"{}\",\"id\":{},\"phase\":{},\"vm\":{},\"vmId\":{},\"method\":{},\"host\":{},\"port\":{},\"ip\":{},\"result\":{},\"up\":{},\"down\":{},\"ms\":{}}}\n",
+            utc_now(), e.id, json_str(e.phase), json_str(e.vm), json_str(e.vm_id), json_str(e.method), json_str(e.host), e.port,
             json_str(e.ip), json_str(e.result), e.up, e.down, e.ms
         )
     }
@@ -102,9 +106,10 @@ mod tests {
     #[test]
     fn json_escaping_and_shape() {
         assert_eq!(json_str("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
-        let l = Logger::line(&Entry { vm: "AgentTest-1", vm_id: "x", method: "CONNECT", host: "github.com",
+        let l = Logger::line(&Entry { id: 7, phase: "close", vm: "AgentTest-1", vm_id: "x", method: "CONNECT", host: "github.com",
                                       port: 443, ip: "1.2.3.4", result: "ok", up: 1, down: 2, ms: 3 });
         assert!(l.starts_with("{\"t\":\"20"));
+        assert!(l.contains(",\"id\":7,\"phase\":\"close\",\"vm\":\"AgentTest-1\","));
         assert!(l.ends_with("\"up\":1,\"down\":2,\"ms\":3}\n"));
     }
 

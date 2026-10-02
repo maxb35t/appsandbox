@@ -1505,7 +1505,7 @@ function closeActivityModal() {
 }
 
 function requestActivity() {
-    sendCmd('getProxyLog', { vm: document.getElementById('act-vm').value, limit: 300 });
+    sendCmd('getProxyLog', { vm: document.getElementById('act-vm').value, limit: 1000 });
 }
 
 function onProxyLog(entries) {
@@ -1519,6 +1519,28 @@ function formatBytes(n) {
     if (n < 1024) return n + ' B';
     if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
     return (n / 1048576).toFixed(1) + ' MB';
+}
+
+/* The proxy logs an "open" line when a connection gets through and a "close" line (bytes,
+   duration) when it ends; both carry the same id. Fold them into one row per connection,
+   keeping the open time. Entries without an id (older logs) pass through unchanged. */
+function mergeActivity(entries) {
+    var open = {}, out = [];
+    entries.forEach(function(e) {
+        if (e.id == null || !e.phase) { out.push(e); return; }
+        var key = (e.vmId || '') + '|' + e.id;
+        if (e.phase === 'open') {
+            var row = Object.assign({}, e, { stillOpen: true });
+            open[key] = row;
+            out.push(row);
+        } else if (open[key]) {
+            Object.assign(open[key], e, { t: open[key].t, stillOpen: false });
+            delete open[key];
+        } else {
+            out.push(e);
+        }
+    });
+    return out;
 }
 
 /* Plain-words result: [label, css class]. The raw code stays in the tooltip. */
@@ -1552,7 +1574,8 @@ function renderActivity() {
     var blockedOnly = document.getElementById('act-blocked').checked;
     var runOnly = document.getElementById('act-run').checked;
     var q = document.getElementById('act-search').value.trim().toLowerCase();
-    var inRun = activityEntries.filter(function(e) { return !runOnly || activityInCurrentRun(e); });
+    var all = mergeActivity(activityEntries);
+    var inRun = all.filter(function(e) { return !runOnly || activityInCurrentRun(e); });
     var rows = inRun.filter(function(e) {
         var res = String(e.result || '');
         if (blockedOnly && res === 'ok') return false;
@@ -1564,7 +1587,7 @@ function renderActivity() {
     rows.forEach(function(e) {
         var tr = document.createElement('tr');
         var res = String(e.result || '');
-        var r = activityResult(res);
+        var r = e.stillOpen ? ['Allowed · still open', 'res-ok'] : activityResult(res);
         var t = new Date(e.t);
         var when = isNaN(t) ? String(e.t || '') : t.toLocaleTimeString() +
             (t.toDateString() === new Date().toDateString() ? '' : ' ' + t.toLocaleDateString());
@@ -1575,9 +1598,9 @@ function renderActivity() {
             [e.port || '', ''],
             [e.method === 'CONNECT' ? 'HTTPS' : (e.method ? 'HTTP ' + e.method : ''), e.method || ''],
             [r[0], res],
-            [formatBytes(e.up), (e.up || 0) + ' bytes', 'num'],
-            [formatBytes(e.down), (e.down || 0) + ' bytes', 'num'],
-            [e.ms != null ? (e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + ' s' : e.ms + ' ms') : '', '', 'num']
+            [e.stillOpen ? '…' : formatBytes(e.up), e.stillOpen ? 'Counted when the connection closes' : (e.up || 0) + ' bytes', 'num'],
+            [e.stillOpen ? '…' : formatBytes(e.down), e.stillOpen ? 'Counted when the connection closes' : (e.down || 0) + ' bytes', 'num'],
+            [e.stillOpen ? 'open' : (e.ms != null ? (e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + ' s' : e.ms + ' ms') : ''), '', 'num']
         ];
         cells.forEach(function(c, k) {
             var td = document.createElement('td');
@@ -1590,11 +1613,13 @@ function renderActivity() {
         tbody.appendChild(tr);
     });
     var blocked = inRun.filter(function(e) { return String(e.result).indexOf('denied') === 0; }).length;
-    document.getElementById('act-count').textContent = activityEntries.length
+    var openNow = inRun.filter(function(e) { return e.stillOpen; }).length;
+    document.getElementById('act-count').textContent = all.length
         ? 'Showing ' + rows.length + ' of ' + inRun.length + ' connections' +
           (runOnly ? ' in the current run' : '') + ' · ' + blocked + ' blocked' +
-          (runOnly && inRun.length < activityEntries.length
-              ? ' · ' + (activityEntries.length - inRun.length) + ' older hidden (untick “This run only”)' : '')
+          (openNow ? ' · ' + openNow + ' still open' : '') +
+          (runOnly && inRun.length < all.length
+              ? ' · ' + (all.length - inRun.length) + ' older hidden (untick “This run only”)' : '')
         : 'Nothing logged yet.';
 }
 
