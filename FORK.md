@@ -20,8 +20,8 @@ suggestions, so this fork is long-lived. Its patch set is kept small and self-co
 1. Download the `appsandbox-fork-x64-<sha>` artifact from the **fork build** workflow run.
 2. Stop App Sandbox (close the window or stop the headless daemon).
 3. In the upstream release folder that matches the fork's base version, back up
-   `AppSandbox.exe`, `appsandbox_core.dll` and `web\app.js`. Then replace them with the
-   artifact's copies (`app.js` is the GUI script; the GUI isn't needed for headless use).
+   `AppSandbox.exe`, `appsandbox_core.dll` and the `web` folder. Then replace them with the
+   artifact's copies (`web` is the GUI; it isn't needed for headless use).
 4. Start App Sandbox. `/v1/version` should report `…+mx.N`.
 
 To roll back, restore the two backed-up files.
@@ -35,3 +35,4 @@ To roll back, restore the two backed-up files.
 | Chained snapshots: snapshot the current branch; snapshots report `parent`; deleting a snapshot with children is refused (409) | done |
 | Throwaway instances: several at once from one snapshot, auto-delete on stop (switchable per instance and globally) | done |
 | Headless display windows close when their VM stops or is deleted (upstream left them frozen) | done |
+| Instance options: GPU/network override, time limit, fast stop; GUI New Instance and Settings dialogs, instance rows | done |

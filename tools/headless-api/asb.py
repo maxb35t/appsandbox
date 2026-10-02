@@ -166,23 +166,31 @@ class Client:
         return self._req("DELETE", "/vms/%s/snapshots/%d/branches/%d" % (name, index, branch_index))
 
     # ---- maxb35t fork: throwaway instances + daemon settings ----
-    def create_instance(self, name, snap_index, ram_mb=None, cpu_cores=None, auto_delete=None):
+    def create_instance(self, name, snap_index, ram_mb=None, cpu_cores=None, auto_delete=None,
+                        gpu_mode=None, network_mode=None, ttl_minutes=None, fast_stop=None):
         """Create and start a throwaway instance of VM `name` layered on its snapshot
         `snap_index` (-2 = the frozen base). Returns (status, body); body["name"] is the
         instance's name (e.g. "AgentTest-1"). The instance is a normal VM for status,
-        ssh_info, displays, shutdown/stop and delete_vm. auto_delete None = the daemon
-        default (settings()["instanceAutoDelete"]); True deletes it once it stops."""
+        ssh_info, displays, shutdown/stop and delete_vm.
+        None = the parent's value (ram_mb, cpu_cores, gpu_mode, network_mode) or the daemon
+        default from settings() (auto_delete, ttl_minutes, fast_stop).
+        gpu_mode 0 = no GPU; ttl_minutes forces it off after N minutes (0 = no limit);
+        fast_stop makes shutdown() force it off instead of a guest shutdown."""
         body = {"snapIndex": snap_index}
-        if ram_mb is not None:      body["ramMb"] = int(ram_mb) - int(ram_mb) % 2
-        if cpu_cores is not None:   body["cpuCores"] = int(cpu_cores)
-        if auto_delete is not None: body["autoDelete"] = bool(auto_delete)
+        if ram_mb is not None:       body["ramMb"] = int(ram_mb) - int(ram_mb) % 2
+        if cpu_cores is not None:    body["cpuCores"] = int(cpu_cores)
+        if auto_delete is not None:  body["autoDelete"] = bool(auto_delete)
+        if gpu_mode is not None:     body["gpuMode"] = int(gpu_mode)
+        if network_mode is not None: body["networkMode"] = int(network_mode)
+        if ttl_minutes is not None:  body["ttlMinutes"] = int(ttl_minutes)
+        if fast_stop is not None:    body["fastStop"] = bool(fast_stop)
         return self._req("POST", "/vms/%s/instances" % name, body)
     def instances(self, name=None):
         """Live instances (status objects), optionally only those of parent VM `name`."""
         return [v for v in self.list() if v.get("ephemeral") and (name is None or v.get("parent") == name)]
     def settings(self):          return self._req("GET", "/settings")[1]
     def set_settings(self, **kw):
-        """e.g. set_settings(instanceAutoDelete=False)."""
+        """e.g. set_settings(instanceAutoDelete=False, instanceTtlMinutes=120, instanceFastStop=True)."""
         return self._req("PUT", "/settings", kw)
 
     def shutdown_daemon(self, force=False):

@@ -285,6 +285,14 @@ static void build_vm_json(JsonBuilder *jb, int i)
     SnapshotTree *st_ = asb_vm_snap_tree(asb_vm_get(i));
     if (!v || !st_) return;
 
+    if (v->dead) {   /* fork: freed instance slot -- keep the index, hide the row */
+        jb_object_begin(jb);
+        jb_string(jb, L"name", L"");
+        jb_bool(jb, L"hidden", TRUE);
+        jb_object_end(jb);
+        return;
+    }
+
     jb_object_begin(jb);
     jb_string(jb, L"name", v->name);
     jb_string(jb, L"osType", v->os_type);
@@ -312,6 +320,22 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
+    /* fork */
+    jb_bool(jb, L"relayChannel", v->relay_channel);
+    jb_bool(jb, L"ephemeral", v->ephemeral);
+    if (v->ephemeral) {
+        wchar_t exp[32];
+        jb_string(jb, L"parent", v->parent_name);
+        jb_int(jb, L"instanceSnap", v->instance_snap);
+        jb_bool(jb, L"autoDelete", v->auto_delete);
+        jb_int(jb, L"ttlMinutes", v->ttl_minutes);
+        swprintf_s(exp, 32, L"%llu", (unsigned long long)v->expires_at);
+        jb_append(jb, jb->count > 0 ? L"," : L"");
+        jb_append(jb, L"\"expiresAt\":");
+        jb_append(jb, exp);
+        jb->count++;
+        jb_bool(jb, L"fastStop", v->fast_stop);
+    }
 
     /* Snapshot tree */
     {
@@ -406,6 +430,20 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_object_end(jb);
 }
 
+/* fork: GUI-wide settings for the Settings dialog, as "settings":{...}. */
+static void append_settings_json(JsonBuilder *jb)
+{
+    wchar_t st[256];
+    swprintf_s(st, 256,
+        L"\"settings\":{\"instanceAutoDelete\":%s,\"instanceTtlMinutes\":%d,\"instanceFastStop\":%s}",
+        asb_get_instance_auto_delete() ? L"true" : L"false",
+        asb_get_instance_ttl_minutes(),
+        asb_get_instance_fast_stop() ? L"true" : L"false");
+    if (jb->count > 0) jb_append(jb, L",");
+    jb_append(jb, st);
+    jb->count++;
+}
+
 static void send_vm_list(void)
 {
     wchar_t buf[131072];
@@ -418,10 +456,14 @@ static void send_vm_list(void)
 
     jb_array_begin(&jb, L"vms");
     for (i = 0; i < count; i++) {
+        VmInstance *dv = asb_vm_instance(asb_vm_get(i));
+        if (dv && dv->dead && i < ASB_MAX_VMS && g_idd_displays[i])
+            safe_destroy_idd(i);   /* fork: its instance was auto-deleted */
         if (i > 0) jb_append(&jb, L",");
         build_vm_json(&jb, i);
     }
     jb_array_end(&jb);
+    append_settings_json(&jb);   /* fork */
 
     {
         wchar_t hi_buf[32768];
@@ -549,10 +591,14 @@ static void send_full_state(void)
     count = asb_vm_count();
     jb_array_begin(&jb, L"vms");
     for (i = 0; i < count; i++) {
+        VmInstance *dv = asb_vm_instance(asb_vm_get(i));
+        if (dv && dv->dead && i < ASB_MAX_VMS && g_idd_displays[i])
+            safe_destroy_idd(i);   /* fork: its instance was auto-deleted */
         if (i > 0) jb_append(&jb, L",");
         build_vm_json(&jb, i);
     }
     jb_array_end(&jb);
+    append_settings_json(&jb);   /* fork */
 
     /* Host info */
     {
@@ -1173,10 +1219,28 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
             int j;
             HRESULT hr;
+            VmInstance *dv = asb_vm_instance(asb_vm_get(idx));
+            if (dv && dv->ephemeral) {
+                /* fork: an instance's slot is freed in place, so the display arrays
+                   keep their indices (no compaction). */
+                ui_log(L"Deleting instance \"%s\"...", dv->name);
+                safe_destroy_rdp(idx);
+                safe_destroy_idd(idx);
+                hr = asb_vm_delete(asb_vm_get(idx));
+                if (FAILED(hr)) ui_log(L"Instance deletion failed (0x%08X).", hr);
+                g_selected_vm = -1;
+                send_vm_list();
+                return;
+            }
             ui_log(L"Deleting VM \"%s\"...", asb_vm_name(asb_vm_get(idx)));
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
             hr = asb_vm_delete(asb_vm_get(idx));
+            if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) {   /* fork */
+                ui_show_alert(L"Delete the running instances before deleting a VM.");
+                send_vm_list();
+                return;
+            }
             if (FAILED(hr)) {
                 ui_log(L"VM deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
                 ui_show_alert(L"VM deletion failed. Check that its disk storage is available and writable.");
@@ -1194,6 +1258,39 @@ static void on_webview2_message(const wchar_t *json)
             send_vm_list();
             ui_log(L"VM deleted.");
         }
+    } else if (wcscmp(action, L"createInstance") == 0) {
+        /* fork: {vmIndex, snapIndex, ramMb?, cpuCores?, gpuMode?, networkMode?,
+                  autoDelete?, ttlMinutes?, fastStop?}; -1 / absent = inherit or default */
+        int vi, iv;
+        BOOL bv;
+        AsbInstanceOptions o;
+        wchar_t iname[256];
+        asb_instance_options_init(&o);
+        if (json_get_int(json, L"vmIndex", &vi) && vi >= 0 && vi < asb_vm_count() &&
+            json_get_int(json, L"snapIndex", &o.snap_idx)) {
+            HRESULT hr;
+            if (json_get_int(json, L"ramMb", &iv) && iv >= 512) o.ram_mb = (DWORD)(iv - iv % 2);
+            if (json_get_int(json, L"cpuCores", &iv) && iv >= 1) o.cpu_cores = (DWORD)iv;
+            if (json_get_int(json, L"gpuMode", &iv)) o.gpu_mode = iv;
+            if (json_get_int(json, L"networkMode", &iv)) o.network_mode = iv;
+            if (json_get_int(json, L"ttlMinutes", &iv) && iv >= 0) o.ttl_minutes = iv;
+            if (json_get_bool(json, L"autoDelete", &bv)) o.auto_delete = bv ? 1 : 0;
+            if (json_get_bool(json, L"fastStop", &bv)) o.fast_stop = bv ? 1 : 0;
+            hr = asb_vm_create_instance_ex(asb_vm_get(vi), &o, iname, 256);
+            if (FAILED(hr)) {
+                ui_log(L"Instance creation failed (0x%08X).", hr);
+                ui_show_alert(L"Couldn't create the instance. Pick a snapshot (or the base once snapshots exist) of an installed VM.");
+            }
+            send_vm_list();
+        }
+    } else if (wcscmp(action, L"setSettings") == 0) {
+        /* fork: {instanceAutoDelete?, instanceTtlMinutes?, instanceFastStop?} */
+        int iv;
+        BOOL bv;
+        if (json_get_bool(json, L"instanceAutoDelete", &bv)) asb_set_instance_auto_delete(bv);
+        if (json_get_int(json, L"instanceTtlMinutes", &iv) && iv >= 0) asb_set_instance_ttl_minutes(iv);
+        if (json_get_bool(json, L"instanceFastStop", &bv)) asb_set_instance_fast_stop(bv);
+        send_vm_list();
     } else if (wcscmp(action, L"deleteTemplate") == 0) {
         wchar_t tpl_name[256] = { 0 };
         json_get_string(json, L"name", tpl_name, 256);

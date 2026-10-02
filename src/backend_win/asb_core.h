@@ -212,10 +212,30 @@ ASB_API BOOL    asb_vm_relay_channel(AsbVm vm);
 ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
                                        DWORD cpu_cores, int auto_delete,
                                        wchar_t *out_name, size_t out_cap);
+
+/* Full set of per-instance options. asb_instance_options_init() sets every field to
+   "use the parent's value / the global default". */
+typedef struct {
+    int   snap_idx;       /* parent snapshot (-2 = frozen base); required */
+    DWORD ram_mb;         /* 0 = parent's */
+    DWORD cpu_cores;      /* 0 = parent's */
+    int   gpu_mode;       /* -1 = parent's, GPU_NONE, GPU_DEFAULT */
+    int   network_mode;   /* -1 = parent's, NET_NONE..NET_INTERNAL */
+    int   auto_delete;    /* -1 = default, 0, 1 */
+    int   ttl_minutes;    /* -1 = default, 0 = no limit, N = forced off after N minutes */
+    int   fast_stop;      /* -1 = default, 0, 1: shutdown forces the instance off */
+} AsbInstanceOptions;
+ASB_API void    asb_instance_options_init(AsbInstanceOptions *o);
+ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions *o,
+                                          wchar_t *out_name, size_t out_cap);
 /* FALSE for a freed instance slot (asb_vm_get can return one; skip it). */
 ASB_API BOOL    asb_vm_is_listed(AsbVm vm);
 ASB_API BOOL    asb_get_instance_auto_delete(void);
 ASB_API void    asb_set_instance_auto_delete(BOOL enabled);
+ASB_API int     asb_get_instance_ttl_minutes(void);
+ASB_API void    asb_set_instance_ttl_minutes(int minutes);
+ASB_API BOOL    asb_get_instance_fast_stop(void);
+ASB_API void    asb_set_instance_fast_stop(BOOL enabled);
 
 /* ---- Snapshots ---- */
 

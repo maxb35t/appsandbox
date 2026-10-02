@@ -557,3 +557,10 @@ th.icon-col, td.icon-col {
     color: #888;
     text-align: center;
 }
+
+/* fork: instances and settings */
+.instance-badge { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 3px;
+    font-size: 11px; color: var(--text-dim); border: 1px solid var(--text-dim); }
+tr.instance-row td:first-child { padding-left: 18px; }
+.settings-heading { margin: 4px 0 8px; font-size: 13px; }
+#btn-settings { margin-left: auto; margin-right: 8px; height: 26px; }

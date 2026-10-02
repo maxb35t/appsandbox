@@ -15,6 +15,7 @@
 <section id="vm-section">
     <div class="section-header">
         <h2>Sandboxes</h2>
+        <button id="btn-settings" class="win-only" onclick="openSettingsModal()" title="App Sandbox settings (instance defaults)">&#9881; Settings</button>
         <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
     </div>
     <div class="vm-table-wrap">
@@ -249,6 +250,7 @@
         </div>
         <div class="modal-buttons">
             <button id="btn-snapshot-create" class="primary" onclick="takeSnapshot()">New Snapshot</button>
+            <button id="btn-snapshot-instance" onclick="openInstanceModal()" title="Start a throwaway copy of the selected snapshot that runs alongside the VM">New Instance&hellip;</button>
             <button id="btn-snapshot-rename" onclick="renameSnapshot()">Rename</button>
             <button id="btn-snapshot-delete" class="danger" onclick="deleteSnapshot()">Delete</button>
             <button onclick="closeSnapshotModal()">Close</button>
@@ -257,6 +259,82 @@
 </div>
 
 <!-- Confirm modal -->
+<!-- fork: throwaway instance options -->
+<div class="modal-overlay" id="instance-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="instance-title">
+        <h3 id="instance-title">New Instance</h3>
+        <div class="modal-form-body">
+            <p id="instance-source"></p>
+            <div class="form-grid">
+                <label for="inst-ram">RAM Size:</label>
+                <div class="form-row"><input type="number" id="inst-ram" min="512" step="2" class="input-sm"> MB</div>
+
+                <label for="inst-cpu">CPU Cores:</label>
+                <div class="form-row"><input type="number" id="inst-cpu" min="1" class="input-sm"></div>
+
+                <label for="inst-gpu">GPU:</label>
+                <div class="form-row">
+                    <select id="inst-gpu">
+                        <option value="-1">Same as VM</option>
+                        <option value="0">None</option>
+                        <option value="1">Default GPU</option>
+                    </select>
+                </div>
+
+                <label for="inst-net">Network:</label>
+                <div class="form-row">
+                    <select id="inst-net">
+                        <option value="-1">Same as VM</option>
+                        <option value="0">None</option>
+                        <option value="1">NAT</option>
+                        <option value="2">External</option>
+                        <option value="3">Internal</option>
+                    </select>
+                </div>
+
+                <label for="inst-ttl">Time limit:</label>
+                <div class="form-row"><input type="number" id="inst-ttl" min="0" class="input-sm"> minutes <span class="host-info">0 = no limit</span></div>
+
+                <label for="inst-autodelete">Auto-delete:</label>
+                <div class="form-row"><input type="checkbox" id="inst-autodelete"> <span class="host-info">delete the instance and its disk when it stops</span></div>
+
+                <label for="inst-faststop">Fast stop:</label>
+                <div class="form-row"><input type="checkbox" id="inst-faststop"> <span class="host-info">Shut Down forces it off instead of shutting Windows down</span></div>
+            </div>
+            <span id="instance-warn" class="field-warn" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeInstanceModal()">Cancel</button>
+            <button id="btn-create-instance" class="primary" onclick="createInstance()">Start Instance</button>
+        </div>
+    </div>
+</div>
+
+<!-- fork: app-wide settings -->
+<div class="modal-overlay" id="settings-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <h3 id="settings-title">Settings</h3>
+        <div class="modal-form-body">
+            <h4 class="settings-heading">Instance defaults</h4>
+            <div class="form-grid">
+                <label for="set-autodelete">Auto-delete:</label>
+                <div class="form-row"><input type="checkbox" id="set-autodelete"> <span class="host-info">delete instances when they stop</span></div>
+
+                <label for="set-ttl">Time limit:</label>
+                <div class="form-row"><input type="number" id="set-ttl" min="0" class="input-sm"> minutes <span class="host-info">0 = no limit</span></div>
+
+                <label for="set-faststop">Fast stop:</label>
+                <div class="form-row"><input type="checkbox" id="set-faststop"> <span class="host-info">Shut Down forces instances off</span></div>
+            </div>
+            <span id="settings-warn" class="field-warn" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="closeSettingsModal()">Cancel</button>
+            <button class="primary" onclick="saveSettings()">Save</button>
+        </div>
+    </div>
+</div>
+
 <div class="modal-overlay" id="modal-overlay">
     <div class="modal">
         <h3 id="modal-title">Confirm</h3>

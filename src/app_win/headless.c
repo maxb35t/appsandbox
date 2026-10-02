@@ -310,8 +310,11 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     if (v->ephemeral) {
         pos += sprintf_s(out + pos, cap - pos, ",\"parent\":");
         pos  = append_wstr(out, cap, pos, v->parent_name);
-        pos += sprintf_s(out + pos, cap - pos, ",\"snapIndex\":%d,\"autoDelete\":%s",
-                         v->instance_snap, v->auto_delete ? "true" : "false");
+        pos += sprintf_s(out + pos, cap - pos,
+                         ",\"snapIndex\":%d,\"autoDelete\":%s,\"ttlMinutes\":%d,\"expiresAt\":%llu,\"fastStop\":%s",
+                         v->instance_snap, v->auto_delete ? "true" : "false",
+                         v->ttl_minutes, (unsigned long long)v->expires_at,
+                         v->fast_stop ? "true" : "false");
     }
     pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
@@ -626,14 +629,23 @@ static int handle_request(PHTTP_REQUEST req)
     /* ---- fork: daemon settings ---- */
     if (wcscmp(path, L"/v1/settings") == 0) {
         if (verb == HttpVerbPUT) {
-            wchar_t body[1024]; BOOL bv;
+            wchar_t body[1024]; BOOL bv; int iv;
             body_to_wide(req, body, 1024);
             if (json_get_bool(body, L"instanceAutoDelete", &bv))
                 asb_set_instance_auto_delete(bv);
+            if (json_get_int(body, L"instanceTtlMinutes", &iv)) {
+                if (iv < 0) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "instanceTtlMinutes must be >= 0"); return 0; }
+                asb_set_instance_ttl_minutes(iv);
+            }
+            if (json_get_bool(body, L"instanceFastStop", &bv))
+                asb_set_instance_fast_stop(bv);
         }
         if (verb == HttpVerbGET || verb == HttpVerbPUT) {
-            sprintf_s(buf, sizeof(buf), "{\"instanceAutoDelete\":%s}",
-                      asb_get_instance_auto_delete() ? "true" : "false");
+            sprintf_s(buf, sizeof(buf),
+                      "{\"instanceAutoDelete\":%s,\"instanceTtlMinutes\":%d,\"instanceFastStop\":%s}",
+                      asb_get_instance_auto_delete() ? "true" : "false",
+                      asb_get_instance_ttl_minutes(),
+                      asb_get_instance_fast_stop() ? "true" : "false");
             send_json(req->RequestId, 200, "OK", buf);
             return 0;
         }
@@ -954,30 +966,47 @@ static int handle_request(PHTTP_REQUEST req)
         /* fork: POST /v1/vms/{n}/instances {snapIndex, ramMb?, cpuCores?, autoDelete?}
            creates and starts a throwaway instance; reply carries its name. */
         if (verb == HttpVerbPOST && wcscmp(sub, L"instances") == 0) {
-            wchar_t body[1024], iname[256];
-            int snap = -1, iv; BOOL bv; DWORD ram = 0, cpu = 0; int ad = -1;
+            /* body: {snapIndex, ramMb?, cpuCores?, gpuMode?, networkMode?, autoDelete?,
+                      ttlMinutes?, fastStop?} -- omitted = parent's value / global default */
+            wchar_t body[2048], iname[256];
+            int iv; BOOL bv;
             HRESULT ihr;
+            AsbInstanceOptions o;
             VmInstance *pv = asb_vm_instance(vm);
-            body_to_wide(req, body, 1024);
-            if (!json_get_int(body, L"snapIndex", &snap)) {
+            asb_instance_options_init(&o);
+            body_to_wide(req, body, 2048);
+            if (!json_get_int(body, L"snapIndex", &o.snap_idx)) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "snapIndex required (-2 = the base)");
                 return 0;
             }
             if (json_get_int(body, L"ramMb", &iv)) {
                 if (iv < 512) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "RAM must be at least 512 MB"); return 0; }
-                ram = (DWORD)(iv - iv % 2);
+                o.ram_mb = (DWORD)(iv - iv % 2);
             }
             if (json_get_int(body, L"cpuCores", &iv)) {
                 if (iv < 1) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "CPU cores must be at least 1"); return 0; }
-                cpu = (DWORD)iv;
+                o.cpu_cores = (DWORD)iv;
             }
-            if (json_get_bool(body, L"autoDelete", &bv)) ad = bv ? 1 : 0;
+            if (json_get_int(body, L"gpuMode", &iv)) {
+                if (iv < 0 || iv > 1) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "gpuMode must be 0 (None) or 1 (Default)"); return 0; }
+                o.gpu_mode = iv;
+            }
+            if (json_get_int(body, L"networkMode", &iv)) {
+                if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0-3"); return 0; }
+                o.network_mode = iv;
+            }
+            if (json_get_int(body, L"ttlMinutes", &iv)) {
+                if (iv < 0) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "ttlMinutes must be >= 0 (0 = no limit)"); return 0; }
+                o.ttl_minutes = iv;
+            }
+            if (json_get_bool(body, L"autoDelete", &bv)) o.auto_delete = bv ? 1 : 0;
+            if (json_get_bool(body, L"fastStop", &bv)) o.fast_stop = bv ? 1 : 0;
             if (pv && (pv->ephemeral || pv->building_vhdx || !pv->install_complete)) {
                 send_err(req->RequestId, 409, "Conflict", "not_instantiable",
                          "instances need an installed, non-instance VM");
                 return 0;
             }
-            ihr = asb_vm_create_instance(vm, snap, ram, cpu, ad, iname, 256);
+            ihr = asb_vm_create_instance_ex(vm, &o, iname, 256);
             if (ihr == E_INVALIDARG) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "snapIndex must be a snapshot index, or -2 for the base once snapshots exist");
