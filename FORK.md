@@ -34,3 +34,4 @@ To roll back, restore the two backed-up files.
 | Dedicated relay channel: Hyper-V socket port 8, per VM, `relayChannel` (off by default) | done |
 | Chained snapshots: snapshot the current branch; snapshots report `parent`; deleting a snapshot with children is refused (409) | done |
 | Throwaway instances: several at once from one snapshot, auto-delete on stop (switchable per instance and globally) | done |
+| Headless display windows close when their VM stops or is deleted (upstream left them frozen) | done |
