@@ -45,7 +45,12 @@
 #ifndef ASB_VERSION_SHORT
 #define ASB_VERSION_SHORT 0.0.0
 #endif
+#ifdef ASB_FORK_TAG
+/* maxb35t fork: report e.g. "0.1.9+mx.1" so fork builds are identifiable. */
+#define ASB_PRODUCT_VER  ASB_VER_STR(ASB_VERSION_SHORT) "+" ASB_VER_STR(ASB_FORK_TAG)
+#else
 #define ASB_PRODUCT_VER  ASB_VER_STR(ASB_VERSION_SHORT)
+#endif
 #define DEFAULT_PORT     8787
 
 /* forward decls (used by the event callbacks defined below) */

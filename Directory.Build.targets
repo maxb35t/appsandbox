@@ -39,6 +39,7 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <PreprocessorDefinitions>ASB_VERSION_SHORT=$(AsbVersionShort);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(AsbForkTag)' != ''">ASB_FORK_TAG=$(AsbForkTag);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
 </Project>
