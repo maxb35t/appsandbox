@@ -9,7 +9,7 @@ use crate::policy::Policy;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,11 +22,12 @@ pub struct Shared {
     pub policy: RwLock<Arc<Policy>>,
     pub log: Logger,
     conns: Mutex<HashMap<String, Arc<AtomicUsize>>>,
+    next_id: AtomicU64,
 }
 
 impl Shared {
     pub fn new(policy: Policy, log: Logger) -> Shared {
-        Shared { policy: RwLock::new(Arc::new(policy)), log, conns: Mutex::new(HashMap::new()) }
+        Shared { policy: RwLock::new(Arc::new(policy)), log, conns: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1) }
     }
     pub fn policy(&self) -> Arc<Policy> {
         match self.policy.read() {
@@ -68,6 +69,8 @@ fn resolve(host: &str, port: u16, block_private: bool) -> Result<Vec<SocketAddr>
 
 pub fn handle(shared: &Shared, mut client: Box<dyn Duplex>, vm_id: &str) {
     let started = Instant::now();
+    // Only uniqueness matters (it pairs a connection's open and close lines).
+    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     let policy = shared.policy();
     let rules = policy.rules_for(vm_id).cloned();
     let vm_name = rules.as_ref().map(|r| if r.name.is_empty() { vm_id.to_string() } else { r.name.clone() })
@@ -77,12 +80,19 @@ pub fn handle(shared: &Shared, mut client: Box<dyn Duplex>, vm_id: &str) {
     let mut entry_port = 0u16;
     let mut entry_ip = String::new();
     let (mut up, mut down) = (0u64, 0u64);
+    let log_it = rules.as_ref().map(|r| r.log).unwrap_or(true);
 
     let result: String = (|| -> String {
         // Read the request first, so every refusal below is a clean HTTP reply.
         let _ = client.set_read_timeout(Some(HEAD_TIMEOUT));
         let (head, extra) = match http::read_head(&mut client) {
             Ok(h) => h,
+            // Browsers open spare connections and never use them, then close them (or, when
+            // the browser exits, reset them): not worth a log line.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe) => return "idle".into(),
             Err(_) => return "error:bad-request".into(),
         };
         let Some(rules) = rules.as_ref() else {
@@ -129,6 +139,13 @@ pub fn handle(shared: &Shared, mut client: Box<dyn Duplex>, vm_id: &str) {
             return "error:connect-failed".into();
         };
         let _ = upstream.set_nodelay(true);
+        // Logged before the client hears back, so the line exists while the tunnel is open.
+        if log_it {
+            shared.log.write(&Entry {
+                id, phase: "open", vm: &vm_name, vm_id, method: &entry_method, host: &entry_host, port: entry_port,
+                ip: &entry_ip, result: "ok", up: 0, down: 0, ms: started.elapsed().as_millis(),
+            });
+        }
         let mut up_w: Box<dyn Duplex> = Box::new(upstream);
 
         match &target {
@@ -164,10 +181,9 @@ pub fn handle(shared: &Shared, mut client: Box<dyn Duplex>, vm_id: &str) {
         "ok".into()
     })();
 
-    let log_it = rules.as_ref().map(|r| r.log).unwrap_or(true);
-    if log_it {
+    if log_it && result != "idle" {
         shared.log.write(&Entry {
-            vm: &vm_name, vm_id, method: &entry_method, host: &entry_host, port: entry_port, ip: &entry_ip,
+            id, phase: "close", vm: &vm_name, vm_id, method: &entry_method, host: &entry_host, port: entry_port, ip: &entry_ip,
             result: &result, up, down, ms: started.elapsed().as_millis(),
         });
     }
@@ -256,6 +272,55 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 403") && out.contains("no proxy policy"), "{out}");
         let out = roundtrip(proxy_with("[default]\n[vm vm-1]\nports=443\n"), "CONNECT example.com:22 HTTP/1.1\r\n\r\n");
         assert!(out.starts_with("HTTP/1.1 403") && out.contains("port-22"), "{out}");
+    }
+
+    /// Like proxy_with, but logging to a fresh temp dir; also returns the handler thread.
+    fn proxy_logged(policy: &str, tag: &str) -> (TcpStream, thread::JoinHandle<()>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asb-proxy-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = Arc::new(Shared::new(Policy::parse(policy), Logger::new(Some(dir.clone()))));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let h = thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            handle(&shared, Box::new(s), "vm-1");
+        });
+        (TcpStream::connect(addr).unwrap(), h, dir.join("proxy.log"))
+    }
+
+    #[test]
+    fn connect_logs_open_then_close() {
+        let (port, up) = upstream();
+        let pol = OPEN.replace("1-ignored", &port.to_string());
+        let (mut c, h, log) = proxy_logged(&pol, "open");
+        c.write_all(format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+        let mut buf = [0u8; 39];
+        c.read_exact(&mut buf).unwrap();
+        // The tunnel is still open: its "open" line is already there.
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("\"phase\":\"open\"") && text.contains("\"result\":\"ok\""), "{text}");
+        c.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        drop(c);
+        h.join().unwrap();
+        up.join().unwrap();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[1].contains("\"phase\":\"close\"") && !lines[1].contains("\"down\":0,"), "{text}");
+        let id = |l: &str| l.split("\"id\":").nth(1).unwrap().split(',').next().unwrap().to_string();
+        assert_eq!(id(lines[0]), id(lines[1]));
+    }
+
+    #[test]
+    fn unused_connection_is_not_logged() {
+        let (c, h, log) = proxy_logged(OPEN, "idle");
+        drop(c);
+        h.join().unwrap();
+        assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty());
     }
 
     #[test]

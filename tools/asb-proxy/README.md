@@ -16,7 +16,10 @@ app in VM ──HTTP(S)_PROXY──▶ asb-proxy guest (127.0.0.1:3128 in the VM
   - checks port, deny list and allow list;
   - resolves the name, then **drops every private, loopback, link-local, multicast or reserved address** before connecting, so a DNS answer can't redirect it to the LAN or the host;
   - tunnels a `CONNECT`, or forwards one plain-HTTP request with `Connection: close`.
-- **Every connection** is logged as one JSON line in `proxy.log`, which is rotated at 10 MB.
+- **Every connection** is logged as JSON lines in `proxy.log`, which is rotated at 10 MB.
+  - A connection that gets through writes an `"phase":"open"` line as soon as it's connected, then a `"phase":"close"` line with the bytes and duration when it ends. Both lines carry the same `id`.
+  - A refused or failed connection writes only a `close` line.
+  - Connections that never send a request aren't logged. Browsers open these spares in advance.
 - **No dependencies.** It reads traffic from untrusted VMs, so it's kept small enough to review in full, and platform calls are hand-declared FFI.
 
 ## Policy file

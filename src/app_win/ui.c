@@ -278,6 +278,36 @@ static void jb_size_gb(JsonBuilder *jb, const wchar_t *key, ULONGLONG bytes)
     jb_string(jb, key, buf);
 }
 
+/* fork: "key":{custom?,blockPrivate,ports,allow,deny,log} for the Proxied network mode. */
+static void jb_proxy_obj(JsonBuilder *jb, const wchar_t *key, const AsbProxyPolicy *p, BOOL with_custom)
+{
+    if (jb->count > 0) jb_append(jb, L",");
+    jb_append(jb, L"\"");
+    jb_append(jb, key);
+    jb_append(jb, L"\":");
+    jb_object_begin(jb);
+    if (with_custom) jb_bool(jb, L"custom", p->custom);
+    jb_bool(jb, L"blockPrivate", p->block_private);
+    jb_string(jb, L"ports", p->ports);
+    jb_string(jb, L"allow", p->allow);
+    jb_string(jb, L"deny", p->deny);
+    jb_bool(jb, L"log", p->log);
+    jb_object_end(jb);
+    jb->count = 1;
+}
+
+/* fork: read {blockPrivate?, ports?, allow?, deny?, log?} from a GUI message onto p. */
+static void read_proxy_fields(const wchar_t *json, AsbProxyPolicy *p)
+{
+    BOOL bv;
+    static wchar_t tmp[1024];
+    if (json_get_bool(json, L"blockPrivate", &bv)) p->block_private = bv;
+    if (json_get_bool(json, L"log", &bv)) p->log = bv;
+    if (json_get_string(json, L"ports", tmp, 128)) wcscpy_s(p->ports, 128, tmp);
+    if (json_get_string(json, L"allow", tmp, 1024)) wcscpy_s(p->allow, 1024, tmp);
+    if (json_get_string(json, L"deny", tmp, 1024)) wcscpy_s(p->deny, 1024, tmp);
+}
+
 static void build_vm_json(JsonBuilder *jb, int i)
 {
     wchar_t disk_directory[MAX_PATH];
@@ -322,6 +352,18 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
     /* fork */
     jb_bool(jb, L"relayChannel", v->relay_channel);
+    {
+        AsbProxyPolicy pp;
+        if (asb_vm_get_proxy(asb_vm_get(i), &pp)) jb_proxy_obj(jb, L"proxy", &pp, TRUE);
+    }
+    if (v->running && v->started_at) {
+        wchar_t st[32];
+        swprintf_s(st, 32, L"%llu", (unsigned long long)v->started_at);
+        jb_append(jb, jb->count > 0 ? L"," : L"");
+        jb_append(jb, L"\"startedAt\":");
+        jb_append(jb, st);
+        jb->count++;
+    }
     jb_bool(jb, L"ephemeral", v->ephemeral);
     if (v->ephemeral) {
         wchar_t exp[32];
@@ -433,15 +475,40 @@ static void build_vm_json(JsonBuilder *jb, int i)
 /* fork: GUI-wide settings for the Settings dialog, as "settings":{...}. */
 static void append_settings_json(JsonBuilder *jb)
 {
-    wchar_t st[256];
-    swprintf_s(st, 256,
-        L"\"settings\":{\"instanceAutoDelete\":%s,\"instanceTtlMinutes\":%d,\"instanceFastStop\":%s}",
-        asb_get_instance_auto_delete() ? L"true" : L"false",
-        asb_get_instance_ttl_minutes(),
-        asb_get_instance_fast_stop() ? L"true" : L"false");
+    AsbProxyPolicy d;
     if (jb->count > 0) jb_append(jb, L",");
-    jb_append(jb, st);
-    jb->count++;
+    jb_append(jb, L"\"settings\":");
+    jb_object_begin(jb);
+    jb_bool(jb, L"instanceAutoDelete", asb_get_instance_auto_delete());
+    jb_int(jb, L"instanceTtlMinutes", asb_get_instance_ttl_minutes());
+    jb_bool(jb, L"instanceFastStop", asb_get_instance_fast_stop());
+    jb_bool(jb, L"proxyServiceRunning", asb_proxy_service_running());
+    asb_get_proxy_defaults(&d);
+    jb_proxy_obj(jb, L"proxy", &d, FALSE);
+    jb_object_end(jb);
+    jb->count = 1;
+}
+
+/* fork: {"type":"proxyLog","entries":[...]} -- recent proxy connections, newest last. */
+static void send_proxy_log(const wchar_t *vm_name, int limit)
+{
+    static const wchar_t head[] = L"{\"type\":\"proxyLog\",\"entries\":";
+    size_t cap = 1024 * 1024, hl = ARRAYSIZE(head) - 1;
+    char *u = (char *)malloc(cap);
+    wchar_t *w = NULL;
+    int wl;
+    if (!u) return;
+    asb_proxy_read_log(vm_name && vm_name[0] ? vm_name : NULL, limit, u, cap);
+    wl = MultiByteToWideChar(CP_UTF8, 0, u, -1, NULL, 0);
+    if (wl > 0) w = (wchar_t *)malloc((hl + (size_t)wl + 2) * sizeof(wchar_t));
+    if (w) {
+        wmemcpy(w, head, hl);
+        MultiByteToWideChar(CP_UTF8, 0, u, -1, w + hl, wl);
+        wcscat_s(w, hl + (size_t)wl + 2, L"}");
+        webview2_post(w);
+        free(w);
+    }
+    free(u);
 }
 
 static void send_vm_list(void)
@@ -1260,7 +1327,8 @@ static void on_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"createInstance") == 0) {
         /* fork: {vmIndex, snapIndex, ramMb?, cpuCores?, gpuMode?, networkMode?,
-                  autoDelete?, ttlMinutes?, fastStop?}; -1 / absent = inherit or default */
+                  autoDelete?, ttlMinutes?, fastStop?, proxyMode?, proxy rule fields?};
+                  -1 / absent = inherit or default */
         int vi, iv;
         BOOL bv;
         AsbInstanceOptions o;
@@ -1276,6 +1344,19 @@ static void on_webview2_message(const wchar_t *json)
             if (json_get_int(json, L"ttlMinutes", &iv) && iv >= 0) o.ttl_minutes = iv;
             if (json_get_bool(json, L"autoDelete", &bv)) o.auto_delete = bv ? 1 : 0;
             if (json_get_bool(json, L"fastStop", &bv)) o.fast_stop = bv ? 1 : 0;
+            {   /* fork: proxyMode "parent" (default) | "defaults" | "custom" + rule fields */
+                static AsbProxyPolicy ip;
+                wchar_t mode[16] = { 0 };
+                json_get_string(json, L"proxyMode", mode, 16);
+                if (wcscmp(mode, L"defaults") == 0) {
+                    ZeroMemory(&ip, sizeof(ip));
+                    o.proxy = &ip;
+                } else if (wcscmp(mode, L"custom") == 0 && asb_vm_get_proxy(asb_vm_get(vi), &ip)) {
+                    ip.custom = TRUE;
+                    read_proxy_fields(json, &ip);
+                    o.proxy = &ip;
+                }
+            }
             hr = asb_vm_create_instance_ex(asb_vm_get(vi), &o, iname, 256);
             if (FAILED(hr)) {
                 ui_log(L"Instance creation failed (0x%08X).", hr);
@@ -1291,6 +1372,43 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"instanceTtlMinutes", &iv) && iv >= 0) asb_set_instance_ttl_minutes(iv);
         if (json_get_bool(json, L"instanceFastStop", &bv)) asb_set_instance_fast_stop(bv);
         send_vm_list();
+    } else if (wcscmp(action, L"setVmProxy") == 0) {
+        /* fork: {vmIndex, custom, blockPrivate?, ports?, allow?, deny?, log?};
+           custom false = use the global defaults. Allowed while the VM runs. */
+        int idx;
+        BOOL bv;
+        AsbProxyPolicy p;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count() &&
+            asb_vm_get_proxy(asb_vm_get(idx), &p)) {
+            p.custom = json_get_bool(json, L"custom", &bv) ? bv : TRUE;
+            read_proxy_fields(json, &p);
+            if (FAILED(asb_vm_set_proxy(asb_vm_get(idx), &p)))
+                ui_show_alert(L"Proxy rules not saved: ports must be a comma-separated list of numbers from 1 to 65535.");
+        }
+        send_vm_list();
+    } else if (wcscmp(action, L"setProxyDefaults") == 0) {
+        /* fork: {blockPrivate?, ports?, allow?, deny?, log?} */
+        AsbProxyPolicy d;
+        asb_get_proxy_defaults(&d);
+        read_proxy_fields(json, &d);
+        if (FAILED(asb_set_proxy_defaults(&d)))
+            ui_show_alert(L"Proxy defaults not saved: ports must be a comma-separated list of numbers from 1 to 65535.");
+        send_vm_list();
+    } else if (wcscmp(action, L"clearProxyLog") == 0) {
+        /* fork */
+        HRESULT hr = asb_proxy_clear_log();
+        if (FAILED(hr)) {
+            ui_log(L"Couldn't clear the proxy log (0x%08X).", hr);
+            ui_show_alert(L"Couldn't clear the proxy log.");
+        }
+        send_proxy_log(NULL, 0);
+    } else if (wcscmp(action, L"getProxyLog") == 0) {
+        /* fork: {vm?, limit?} */
+        wchar_t vm_name[256] = { 0 };
+        int limit = 300;
+        json_get_string(json, L"vm", vm_name, 256);
+        json_get_int(json, L"limit", &limit);
+        send_proxy_log(vm_name, limit);
     } else if (wcscmp(action, L"deleteTemplate") == 0) {
         wchar_t tpl_name[256] = { 0 };
         json_get_string(json, L"name", tpl_name, 256);

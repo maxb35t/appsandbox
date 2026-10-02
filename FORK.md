@@ -38,3 +38,4 @@ To roll back, restore the two backed-up files.
 | Instance options: GPU/network override, time limit, fast stop; GUI New Instance and Settings dialogs, instance rows | done |
 | asb-proxy: filtering proxy (tools/asb-proxy), the AppSandboxProxy service | done |
 | Proxied network mode (4): App Sandbox installs and starts the proxy service and writes per-VM rules; API | done |
+| Proxy GUI: Proxied option in Edit and New Instance, per-VM proxy rules, proxy defaults in Settings, Proxy activity view | done |

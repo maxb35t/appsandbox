@@ -277,7 +277,8 @@ VM traffic reaches it over Hyper-V socket channel 8.
 |---|---|
 | `proxy_policy(name)` / `set_proxy_policy(name, **fields)` | Read or change a VM's rules. `custom=False` returns it to the defaults. Changes apply within about 2 s, even while the VM runs. |
 | `settings()["proxy"]` / `set_settings(proxy={...})` | The global defaults. `settings()["proxyServiceRunning"]` shows whether the service is running. |
-| `proxy_log(vm=None, limit=100)` | Recent connections: time, VM, method, host, port, IP, result (`ok`, `denied:...`, `error:...`), bytes in each direction, duration. |
+| `proxy_log(vm=None, limit=100)` / `clear_proxy_log()` | Recent connections: time, VM, method, host, port, IP, result (`ok`, `denied:...`, `error:...`), bytes in each direction, duration. `clear_proxy_log()` (`DELETE /v1/proxy/log`) empties the log. Status objects carry `startedAt` (unix time of the last start, 0 when stopped) to tell runs apart. |
+| `create_instance(..., proxy=...)` | A Proxied instance's own rules from the start: `None` = its parent's, `"defaults"` = the global defaults, or a dict such as `{"allow": "github.com", "ports": "443"}` (keys `blockPrivate`, `ports`, `allow`, `deny`, `log`). API body keys: `proxyCustom` (false = defaults) or `proxyBlockPrivate`, `proxyPorts`, `proxyAllow`, `proxyDeny`, `proxyLog`. |
 
 ### Events (SSE)
 `events()` is a generator yielding parsed dicts as the daemon pushes them. It

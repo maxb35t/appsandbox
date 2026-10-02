@@ -135,6 +135,7 @@ typedef struct {
     ULONGLONG   expires_at;              /* fork: unix time the limit hits (0 = none) */
     volatile LONG ttl_fired;             /* fork: 1 once the limit has stopped it */
     BOOL        fast_stop;               /* fork: shutdown = force off (throwaway disk) */
+    ULONGLONG   started_at;              /* fork: unix time of the last successful start (0 = unknown) */
 
     /* fork: proxy rules for NET_PROXIED (proxy_custom FALSE = use the global defaults) */
     BOOL        proxy_custom;

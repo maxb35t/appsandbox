@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <wchar.h>
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
@@ -333,8 +334,9 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
-    pos += sprintf_s(out + pos, cap - pos, ",\"relayChannel\":%s,\"ephemeral\":%s",
-                     v->relay_channel ? "true" : "false", v->ephemeral ? "true" : "false");   /* fork */
+    pos += sprintf_s(out + pos, cap - pos, ",\"relayChannel\":%s,\"ephemeral\":%s,\"startedAt\":%llu",
+                     v->relay_channel ? "true" : "false", v->ephemeral ? "true" : "false",
+                     (unsigned long long)(v->running ? v->started_at : 0));   /* fork */
     if (v->ephemeral) {
         pos += sprintf_s(out + pos, cap - pos, ",\"parent\":");
         pos  = append_wstr(out, cap, pos, v->parent_name);
@@ -666,6 +668,12 @@ static int handle_request(PHTTP_REQUEST req)
     display_sweep_orphans();   /* fork */
 
     /* ---- fork: proxy connection log: GET /v1/proxy/log?vm=NAME&limit=N ---- */
+    if (verb == HttpVerbDELETE && wcscmp(path, L"/v1/proxy/log") == 0) {
+        HRESULT chr = asb_proxy_clear_log();
+        if (FAILED(chr)) { send_hr(req->RequestId, "clearProxyLog", "", chr); return 0; }
+        send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"cleared\":true}");
+        return 0;
+    }
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/proxy/log") == 0) {
         wchar_t vmq[256] = { 0 };
         int limit = 100, n;
@@ -1050,14 +1058,15 @@ static int handle_request(PHTTP_REQUEST req)
            creates and starts a throwaway instance; reply carries its name. */
         if (verb == HttpVerbPOST && wcscmp(sub, L"instances") == 0) {
             /* body: {snapIndex, ramMb?, cpuCores?, gpuMode?, networkMode?, autoDelete?,
-                      ttlMinutes?, fastStop?} -- omitted = parent's value / global default */
-            wchar_t body[2048], iname[256];
+                      ttlMinutes?, fastStop?, proxy*?} -- omitted = parent's value / global default */
+            static wchar_t body[8192];
+            wchar_t iname[256];
             int iv; BOOL bv;
             HRESULT ihr;
             AsbInstanceOptions o;
             VmInstance *pv = asb_vm_instance(vm);
             asb_instance_options_init(&o);
-            body_to_wide(req, body, 2048);
+            body_to_wide(req, body, 8192);
             if (!json_get_int(body, L"snapIndex", &o.snap_idx)) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "snapIndex required (-2 = the base)");
                 return 0;
@@ -1082,6 +1091,22 @@ static int handle_request(PHTTP_REQUEST req)
                 if (iv < 0) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "ttlMinutes must be >= 0 (0 = no limit)"); return 0; }
                 o.ttl_minutes = iv;
             }
+            {   /* fork: proxyCustom? (false = global defaults) or any of proxyBlockPrivate,
+                   proxyPorts, proxyAllow, proxyDeny, proxyLog (= own rules, starting from
+                   the parent's). Omitted = the parent's rules. */
+                static AsbProxyPolicy ip;
+                static wchar_t tmp[1024];
+                BOOL any = FALSE;
+                if (pv) asb_vm_get_proxy(vm, &ip); else ZeroMemory(&ip, sizeof(ip));
+                ip.custom = TRUE;
+                if (json_get_bool(body, L"proxyBlockPrivate", &bv)) { ip.block_private = bv; any = TRUE; }
+                if (json_get_bool(body, L"proxyLog", &bv)) { ip.log = bv; any = TRUE; }
+                if (json_get_string(body, L"proxyPorts", tmp, 128)) { wcscpy_s(ip.ports, 128, tmp); any = TRUE; }
+                if (json_get_string(body, L"proxyAllow", tmp, 1024)) { wcscpy_s(ip.allow, 1024, tmp); any = TRUE; }
+                if (json_get_string(body, L"proxyDeny", tmp, 1024)) { wcscpy_s(ip.deny, 1024, tmp); any = TRUE; }
+                if (json_get_bool(body, L"proxyCustom", &bv) && !bv) { ip.custom = FALSE; any = TRUE; }
+                if (any) o.proxy = &ip;
+            }
             if (json_get_bool(body, L"autoDelete", &bv)) o.auto_delete = bv ? 1 : 0;
             if (json_get_bool(body, L"fastStop", &bv)) o.fast_stop = bv ? 1 : 0;
             if (pv && (pv->ephemeral || pv->building_vhdx || !pv->install_complete)) {
@@ -1092,7 +1117,9 @@ static int handle_request(PHTTP_REQUEST req)
             ihr = asb_vm_create_instance_ex(vm, &o, iname, 256);
             if (ihr == E_INVALIDARG) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
-                         "snapIndex must be a snapshot index, or -2 for the base once snapshots exist");
+                         o.proxy && o.proxy->custom
+                             ? "snapIndex must be a snapshot index (or -2 for the base), and proxyPorts a comma list of 1-65535"
+                             : "snapIndex must be a snapshot index, or -2 for the base once snapshots exist");
                 return 0;
             }
             if (ihr == HRESULT_FROM_WIN32(ERROR_NO_MORE_ITEMS)) {

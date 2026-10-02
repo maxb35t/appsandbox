@@ -164,6 +164,25 @@ BOOL proxy_mgr_service_running(void)
     return running;
 }
 
+HRESULT proxy_mgr_clear_log(void)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    HANDLE h;
+    if (!proxy_mgr_dir(dir, MAX_PATH)) return E_FAIL;
+    swprintf_s(path, MAX_PATH, L"%s\\proxy.log", dir);
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        if (e != ERROR_FILE_NOT_FOUND) return HRESULT_FROM_WIN32(e);
+    } else {
+        CloseHandle(h);
+    }
+    swprintf_s(path, MAX_PATH, L"%s\\proxy.log.1", dir);
+    DeleteFileW(path);
+    return S_OK;
+}
+
 int proxy_mgr_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap)
 {
     wchar_t dir[MAX_PATH], path[MAX_PATH];

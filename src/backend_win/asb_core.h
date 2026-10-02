@@ -213,6 +213,16 @@ ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
                                        DWORD cpu_cores, int auto_delete,
                                        wchar_t *out_name, size_t out_cap);
 
+/* fork: proxy rules for the Proxied network mode (see the proxy API below). */
+typedef struct {
+    BOOL    custom;
+    BOOL    block_private;
+    wchar_t ports[128];
+    wchar_t allow[1024];
+    wchar_t deny[1024];
+    BOOL    log;
+} AsbProxyPolicy;
+
 /* Full set of per-instance options. asb_instance_options_init() sets every field to
    "use the parent's value / the global default". */
 typedef struct {
@@ -220,10 +230,11 @@ typedef struct {
     DWORD ram_mb;         /* 0 = parent's */
     DWORD cpu_cores;      /* 0 = parent's */
     int   gpu_mode;       /* -1 = parent's, GPU_NONE, GPU_DEFAULT */
-    int   network_mode;   /* -1 = parent's, NET_NONE..NET_INTERNAL */
+    int   network_mode;   /* -1 = parent's, NET_NONE..NET_PROXIED */
     int   auto_delete;    /* -1 = default, 0, 1 */
     int   ttl_minutes;    /* -1 = default, 0 = no limit, N = forced off after N minutes */
     int   fast_stop;      /* -1 = default, 0, 1: shutdown forces the instance off */
+    const AsbProxyPolicy *proxy;   /* NULL = the parent's rules; custom FALSE = the global defaults */
 } AsbInstanceOptions;
 ASB_API void    asb_instance_options_init(AsbInstanceOptions *o);
 ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions *o,
@@ -236,19 +247,12 @@ ASB_API void    asb_set_instance_auto_delete(BOOL enabled);
    custom FALSE = the VM uses the global defaults. ports: comma list of 1-65535. allow/deny:
    comma lists of host names (a name matches itself and its subdomains; empty allow = any).
    block_private refuses LAN, host, loopback and other non-public addresses after DNS. */
-typedef struct {
-    BOOL    custom;
-    BOOL    block_private;
-    wchar_t ports[128];
-    wchar_t allow[1024];
-    wchar_t deny[1024];
-    BOOL    log;
-} AsbProxyPolicy;
 ASB_API BOOL    asb_vm_get_proxy(AsbVm vm, AsbProxyPolicy *out);     /* effective rules */
 ASB_API HRESULT asb_vm_set_proxy(AsbVm vm, const AsbProxyPolicy *p); /* allowed while running */
 ASB_API void    asb_get_proxy_defaults(AsbProxyPolicy *out);
 ASB_API HRESULT asb_set_proxy_defaults(const AsbProxyPolicy *p);
 ASB_API int     asb_proxy_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap);
+ASB_API HRESULT asb_proxy_clear_log(void);   /* empties proxy.log, removes proxy.log.1 */
 ASB_API BOOL    asb_proxy_service_running(void);
 
 ASB_API int     asb_get_instance_ttl_minutes(void);
