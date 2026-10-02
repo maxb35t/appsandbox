@@ -36,7 +36,7 @@ function toggleSection(id) {
     });
 })();
 
-const netNames = ['None', 'NAT', 'External', 'Internal'];
+const netNames = ['None', 'NAT', 'External', 'Internal', 'Proxied'];
 
 /* ---- Message bridge ----
  *
@@ -150,6 +150,7 @@ window.onHostMessage = function(msg) {
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':         showModal('Error', msg.message, 'OK'); break;
+        case 'proxyLog':      onProxyLog(msg.entries || []); break;   /* fork */
         case 'prereqRequired': onPrereqRequired(); break;
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
@@ -893,6 +894,18 @@ document.addEventListener('keydown', function(e) {
         else trapModalFocus(e, confirmOverlay);
         return;
     }
+    var activityOverlay = document.getElementById('activity-overlay');   /* fork */
+    if (activityOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') { e.preventDefault(); closeActivityModal(); }
+        else trapModalFocus(e, activityOverlay);
+        return;
+    }
+    var proxyOverlay = document.getElementById('proxy-overlay');   /* fork */
+    if (proxyOverlay.classList.contains('active')) {
+        if (e.key === 'Escape') { e.preventDefault(); closeProxyModal(); }
+        else trapModalFocus(e, proxyOverlay);
+        return;
+    }
     var diskOverlay = document.getElementById('disk-location-overlay');
     if (diskOverlay.classList.contains('active')) {
         if (e.key === 'Escape') { e.preventDefault(); closeDiskLocationModal(false); }
@@ -920,6 +933,10 @@ document.addEventListener('keydown', function(e) {
     if (e.key !== 'Escape') return;
     if (document.getElementById('create-vm-overlay').classList.contains('active')) {
         closeCreateModal();
+    } else if (document.getElementById('settings-overlay').classList.contains('active')) {
+        closeSettingsModal();   /* fork */
+    } else if (document.getElementById('instance-overlay').classList.contains('active')) {
+        closeInstanceModal();   /* fork */
     }
 });
 
@@ -1033,9 +1050,10 @@ function buildRowCells(vm, i, statusTd) {
             hostBridge.isMac && vm.osType === 'Windows'
                 ? 'Windows software rendering (WARP) on the CPU'
                 : 'GPU passed through to the VM via GPU-PV, or None'),
+        vm.networkMode === 4 && !hostBridge.isMac ? proxiedNetCell(vm) :
         makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
             hostBridge.isMac ? 'NAT (shared networking)'
-                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), Proxied (filtered web), or None'),
     ];
     if (!hostBridge.isMac) cells.push(vm.ephemeral
         ? makeCell('(instance)', 'Instances run on their own throwaway disk and have no snapshots')
@@ -1125,7 +1143,8 @@ function renderVmTable() {
                while running), so the rebuild-skip optimization above is preserved. */
             vm.hasSnapshots, vm.snapCurrent, vm.snapCurrentBranch,
             JSON.stringify(vm.snapshots || []), JSON.stringify(vm.baseBranches || []),
-            vm.ephemeral, vm.autoDelete, vm.fastStop, instanceTimeLeft(vm)
+            vm.ephemeral, vm.autoDelete, vm.fastStop, instanceTimeLeft(vm),
+            JSON.stringify(vm.proxy || null)
         ].join('|');
 
         if (!firstBuild && rowSigCache[vm.name] === sig) {
@@ -1253,6 +1272,14 @@ function openSettingsModal() {
     document.getElementById('set-autodelete').checked = !!appSettings.instanceAutoDelete;
     document.getElementById('set-ttl').value = appSettings.instanceTtlMinutes || 0;
     document.getElementById('set-faststop').checked = !!appSettings.instanceFastStop;
+    var d = appSettings.proxy || {};
+    document.getElementById('set-proxy-private').checked = d.blockPrivate !== false;
+    document.getElementById('set-proxy-ports').value = d.ports || '80,443';
+    document.getElementById('set-proxy-allow').value = d.allow || '';
+    document.getElementById('set-proxy-deny').value = d.deny || '';
+    document.getElementById('set-proxy-log').checked = d.log !== false;
+    document.getElementById('set-proxy-service').textContent = appSettings.proxyServiceRunning
+        ? '(proxy service running)' : '(proxy service not running; it starts with the first Proxied VM)';
     document.getElementById('settings-warn').textContent = '';
     document.getElementById('settings-overlay').classList.add('active');
 }
@@ -1264,6 +1291,13 @@ function closeSettingsModal() {
 function saveSettings() {
     var ttl = parseInt(document.getElementById('set-ttl').value, 10);
     if (!(ttl >= 0)) { document.getElementById('settings-warn').textContent = 'Time limit must be 0 or more minutes.'; return; }
+    var rules = proxyFormValues('set-proxy-private', 'set-proxy-ports', 'set-proxy-allow', 'set-proxy-deny', 'set-proxy-log');
+    var err = proxyPortsError(rules.ports);
+    if (err) { document.getElementById('settings-warn').textContent = err; return; }
+    var d = appSettings.proxy || {};
+    if (rules.blockPrivate !== d.blockPrivate || rules.ports !== d.ports || rules.allow !== d.allow ||
+        rules.deny !== d.deny || rules.log !== d.log)
+        sendCmd('setProxyDefaults', rules);
     sendCmd('setSettings', {
         instanceAutoDelete: document.getElementById('set-autodelete').checked,
         instanceTtlMinutes: ttl,
@@ -1290,6 +1324,193 @@ function makeIconCell(cls, icon, active, handler, extraClass, title) {
     else btn.disabled = true;
     td.appendChild(btn);
     return td;
+}
+
+/* ---- fork: Proxied network mode ---- */
+
+var proxyModal = null;      /* { name } */
+var activityEntries = [];
+var activityTimer = null;
+
+function proxySummary(p, short) {
+    if (!p) return '';
+    var bits = [];
+    if (p.custom === false) bits.push('defaults');
+    bits.push(p.allow ? 'only ' + p.allow : 'any site');
+    if (p.deny) bits.push('blocks ' + p.deny);
+    bits.push('ports ' + (p.ports || '80,443'));
+    bits.push(p.blockPrivate ? 'LAN blocked' : 'LAN allowed');
+    if (!short && !p.log) bits.push('not logged');
+    return bits.join(' · ');
+}
+
+function proxiedNetCell(vm) {
+    var td = makeCell('Proxied',
+        'Filtered web access through the App Sandbox proxy: ' + proxySummary(vm.proxy) + '. Click to change the rules.');
+    td.className = 'clickable-cell';
+    td.onclick = function(e) { e.stopPropagation(); openProxyModal(vm.name); };
+    return td;
+}
+
+function proxyFormValues(privId, portsId, allowId, denyId, logId) {
+    function list(id) {
+        return document.getElementById(id).value.split(/[\s,;]+/).filter(Boolean).join(', ');
+    }
+    return {
+        blockPrivate: document.getElementById(privId).checked,
+        ports: document.getElementById(portsId).value.split(/[\s,;]+/).filter(Boolean).join(','),
+        allow: list(allowId),
+        deny: list(denyId),
+        log: document.getElementById(logId).checked
+    };
+}
+
+function proxyPortsError(ports) {
+    var list = ports.split(',');
+    if (!ports || list.some(function(p) { var n = Number(p); return !/^\d+$/.test(p) || n < 1 || n > 65535; }))
+        return 'Ports must be a comma-separated list of numbers from 1 to 65535.';
+    return '';
+}
+
+function openProxyModal(name) {
+    var vm = vms[vmIndexByName(name)];
+    if (!vm) return;
+    var p = vm.proxy || {};
+    proxyModal = { name: name };
+    document.getElementById('proxy-title').textContent = 'Proxy rules for ' + name;
+    document.getElementById('proxy-note').textContent = (vm.networkMode === 4
+        ? 'Changes apply within a few seconds, even while the VM runs.'
+        : 'These rules apply when the VM’s network is set to Proxied.') +
+        (vm.ephemeral ? ' This instance started with ' + vm.parent + '’s rules.' : '');
+    document.getElementById('pv-defaults').checked = p.custom === false;
+    fillProxyForm(p.custom === false ? (appSettings.proxy || p) : p);
+    document.getElementById('proxy-warn').textContent = '';
+    updateProxyModal();
+    document.getElementById('proxy-overlay').classList.add('active');
+    document.getElementById('pv-defaults').focus();
+}
+
+function openProxyModalFromEdit() {
+    if (editVmState) openProxyModal(editVmState.name);
+}
+
+function fillProxyForm(p) {
+    document.getElementById('pv-private').checked = p.blockPrivate !== false;
+    document.getElementById('pv-ports').value = p.ports || '80,443';
+    document.getElementById('pv-allow').value = p.allow || '';
+    document.getElementById('pv-deny').value = p.deny || '';
+    document.getElementById('pv-log').checked = p.log !== false;
+}
+
+function updateProxyModal() {
+    var useDefaults = document.getElementById('pv-defaults').checked;
+    if (useDefaults) fillProxyForm(appSettings.proxy || {});
+    ['pv-private', 'pv-ports', 'pv-allow', 'pv-deny', 'pv-log'].forEach(function(id) {
+        document.getElementById(id).disabled = useDefaults;
+    });
+}
+
+function closeProxyModal() {
+    proxyModal = null;
+    document.getElementById('proxy-overlay').classList.remove('active');
+}
+
+function saveProxyModal() {
+    if (!proxyModal) return;
+    var idx = vmIndexByName(proxyModal.name);
+    if (idx < 0) { closeProxyModal(); return; }
+    if (document.getElementById('pv-defaults').checked) {
+        sendCmd('setVmProxy', { vmIndex: idx, custom: false });
+    } else {
+        var rules = proxyFormValues('pv-private', 'pv-ports', 'pv-allow', 'pv-deny', 'pv-log');
+        var err = proxyPortsError(rules.ports);
+        if (err) { document.getElementById('proxy-warn').textContent = err; return; }
+        rules.vmIndex = idx;
+        rules.custom = true;
+        sendCmd('setVmProxy', rules);
+    }
+    closeProxyModal();
+}
+
+function openActivityModal(vmName) {
+    var sel = document.getElementById('act-vm');
+    sel.textContent = '';
+    var all = document.createElement('option');
+    all.value = ''; all.textContent = 'All VMs';
+    sel.appendChild(all);
+    vms.forEach(function(vm) {
+        if (vm.hidden || !vm.name) return;
+        var o = document.createElement('option');
+        o.value = vm.name;
+        o.textContent = vm.name + (vm.networkMode === 4 ? '' : ' (not Proxied)');
+        sel.appendChild(o);
+    });
+    sel.value = vmName && vmIndexByName(vmName) >= 0 ? vmName : '';
+    activityEntries = [];
+    renderActivity();
+    document.getElementById('activity-overlay').classList.add('active');
+    requestActivity();
+    if (activityTimer) clearInterval(activityTimer);
+    activityTimer = setInterval(function() {
+        if (document.getElementById('act-auto').checked) requestActivity();
+    }, 3000);
+    sel.focus();
+}
+
+function closeActivityModal() {
+    if (activityTimer) clearInterval(activityTimer);
+    activityTimer = null;
+    document.getElementById('activity-overlay').classList.remove('active');
+}
+
+function requestActivity() {
+    sendCmd('getProxyLog', { vm: document.getElementById('act-vm').value, limit: 300 });
+}
+
+function onProxyLog(entries) {
+    if (!document.getElementById('activity-overlay').classList.contains('active')) return;
+    activityEntries = entries;
+    renderActivity();
+}
+
+function formatBytes(n) {
+    if (!n) return '0';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+}
+
+function renderActivity() {
+    var tbody = document.querySelector('#act-table tbody');
+    var blockedOnly = document.getElementById('act-blocked').checked;
+    var rows = activityEntries.filter(function(e) {
+        return !blockedOnly || String(e.result).indexOf('ok') !== 0;
+    }).reverse();   /* newest first */
+    tbody.textContent = '';
+    rows.forEach(function(e) {
+        var tr = document.createElement('tr');
+        var res = String(e.result || '');
+        if (res.indexOf('denied') === 0) tr.className = 'act-denied';
+        else if (res.indexOf('error') === 0) tr.className = 'act-error';
+        var t = new Date(e.t);
+        var when = isNaN(t) ? String(e.t || '') : t.toLocaleTimeString() +
+            (t.toDateString() === new Date().toDateString() ? '' : ' ' + t.toLocaleDateString());
+        [when, e.vm || e.vmId || '?',
+         (e.method || '') + ' ' + (e.host || '') + (e.port ? ':' + e.port : ''),
+         res, formatBytes(e.up), formatBytes(e.down), e.ms
+        ].forEach(function(text, k) {
+            var td = document.createElement('td');
+            td.textContent = text;
+            if (k === 2 && e.ip) td.title = 'Connected to ' + e.ip;
+            if (k === 1 && e.vmId) td.title = 'VM id ' + e.vmId;
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+    var blocked = activityEntries.filter(function(e) { return String(e.result).indexOf('denied') === 0; }).length;
+    document.getElementById('act-count').textContent =
+        activityEntries.length + ' connections, ' + blocked + ' blocked' +
+        (activityEntries.length ? '' : ' (nothing logged yet)');
 }
 
 /* ---- VM Selection ---- */
@@ -1376,6 +1597,9 @@ function updateEditVmModal() {
     document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
         el.disabled = !!disabled;
     });
+    var proxied = !hostBridge.isMac && document.getElementById('edit-net-mode').value === '4';
+    document.querySelectorAll('.edit-proxy-row').forEach(function(el) { el.style.display = proxied ? '' : 'none'; });
+    if (proxied) document.getElementById('edit-proxy-summary').textContent = proxySummary(vm.proxy, true);
     var values = editVmValues();
     var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
     document.getElementById('edit-vm-warn').textContent = error;

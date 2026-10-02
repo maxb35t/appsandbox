@@ -15,7 +15,8 @@
 <section id="vm-section">
     <div class="section-header">
         <h2>Sandboxes</h2>
-        <button id="btn-settings" class="win-only" onclick="openSettingsModal()" title="App Sandbox settings (instance defaults)">&#9881; Settings</button>
+        <button id="btn-proxy-activity" class="win-only" onclick="openActivityModal()" title="Recent web connections made by Proxied VMs">&#128737; Proxy activity</button>
+        <button id="btn-settings" class="win-only" onclick="openSettingsModal()" title="App Sandbox settings (instance and proxy defaults)">&#9881; Settings</button>
         <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
     </div>
     <div class="vm-table-wrap">
@@ -227,7 +228,14 @@
                         <option value="1">NAT</option>
                         <option value="2">External</option>
                         <option value="3">Internal</option>
+                        <option value="4">Proxied (filtered web)</option>
                     </select>
+                </div>
+
+                <span class="win-only edit-proxy-row"></span>
+                <div class="form-row win-only edit-proxy-row">
+                    <span class="host-info" id="edit-proxy-summary"></span>
+                    <button type="button" class="small-btn" onclick="openProxyModalFromEdit()">Proxy rules&hellip;</button>
                 </div>
             </div>
             <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>
@@ -289,6 +297,7 @@
                         <option value="1">NAT</option>
                         <option value="2">External</option>
                         <option value="3">Internal</option>
+                        <option value="4">Proxied (filtered web)</option>
                     </select>
                 </div>
 
@@ -326,11 +335,87 @@
                 <label for="set-faststop">Fast stop:</label>
                 <div class="form-row"><input type="checkbox" id="set-faststop"> <span class="host-info">Shut Down forces instances off</span></div>
             </div>
+            <h4 class="settings-heading">Proxy defaults <span class="host-info" id="set-proxy-service"></span></h4>
+            <p class="host-info">Used by every VM in the Proxied network mode unless it has its own rules.</p>
+            <div class="form-grid">
+                <label for="set-proxy-private">Block LAN:</label>
+                <div class="form-row"><input type="checkbox" id="set-proxy-private"> <span class="host-info">refuse private, LAN, host and loopback addresses (checked after DNS)</span></div>
+
+                <label for="set-proxy-ports">Ports:</label>
+                <div class="form-row"><input type="text" id="set-proxy-ports" class="input-md" placeholder="80,443"></div>
+
+                <label for="set-proxy-allow">Allow only:</label>
+                <div class="form-row"><textarea id="set-proxy-allow" rows="2" placeholder="empty = any site; e.g. github.com, crates.io"></textarea></div>
+
+                <label for="set-proxy-deny">Block:</label>
+                <div class="form-row"><textarea id="set-proxy-deny" rows="2" placeholder="e.g. example.com (also blocks its subdomains)"></textarea></div>
+
+                <label for="set-proxy-log">Log:</label>
+                <div class="form-row"><input type="checkbox" id="set-proxy-log"> <span class="host-info">record connections (Proxy activity)</span></div>
+            </div>
             <span id="settings-warn" class="field-warn" aria-live="polite"></span>
         </div>
         <div class="modal-buttons">
             <button onclick="closeSettingsModal()">Cancel</button>
             <button class="primary" onclick="saveSettings()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- fork: per-VM proxy rules (Proxied network mode) -->
+<div class="modal-overlay" id="proxy-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="proxy-title">
+        <h3 id="proxy-title">Proxy rules</h3>
+        <div class="modal-form-body">
+            <p class="host-info" id="proxy-note"></p>
+            <div class="form-grid">
+                <label for="pv-defaults">Use defaults:</label>
+                <div class="form-row"><input type="checkbox" id="pv-defaults" onchange="updateProxyModal()"> <span class="host-info">follow the proxy defaults in Settings</span></div>
+
+                <label for="pv-private">Block LAN:</label>
+                <div class="form-row"><input type="checkbox" id="pv-private"> <span class="host-info">refuse private, LAN, host and loopback addresses (checked after DNS)</span></div>
+
+                <label for="pv-ports">Ports:</label>
+                <div class="form-row"><input type="text" id="pv-ports" class="input-md" placeholder="80,443"></div>
+
+                <label for="pv-allow">Allow only:</label>
+                <div class="form-row"><textarea id="pv-allow" rows="2" placeholder="empty = any site; e.g. github.com, crates.io"></textarea></div>
+
+                <label for="pv-deny">Block:</label>
+                <div class="form-row"><textarea id="pv-deny" rows="2" placeholder="e.g. example.com (also blocks its subdomains)"></textarea></div>
+
+                <label for="pv-log">Log:</label>
+                <div class="form-row"><input type="checkbox" id="pv-log"> <span class="host-info">record connections (Proxy activity)</span></div>
+            </div>
+            <span id="proxy-warn" class="field-warn" aria-live="polite"></span>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="openActivityModal(proxyModal &amp;&amp; proxyModal.name)">Activity&hellip;</button>
+            <button onclick="closeProxyModal()">Cancel</button>
+            <button class="primary" onclick="saveProxyModal()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- fork: proxy activity (recent connections) -->
+<div class="modal-overlay" id="activity-overlay">
+    <div class="modal wide activity-modal" role="dialog" aria-modal="true" aria-labelledby="activity-title">
+        <h3 id="activity-title">Proxy activity</h3>
+        <div class="activity-bar">
+            <label>VM: <select id="act-vm" onchange="requestActivity()"></select></label>
+            <label><input type="checkbox" id="act-blocked" onchange="renderActivity()"> Blocked only</label>
+            <label><input type="checkbox" id="act-auto" checked> Auto-refresh</label>
+            <span class="host-info" id="act-count"></span>
+        </div>
+        <div class="activity-wrap">
+            <table id="act-table">
+                <thead><tr><th>Time</th><th>VM</th><th>Request</th><th>Result</th><th>Sent</th><th>Received</th><th>ms</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+        <div class="modal-buttons">
+            <button onclick="requestActivity()">Refresh</button>
+            <button onclick="closeActivityModal()">Close</button>
         </div>
     </div>
 </div>
