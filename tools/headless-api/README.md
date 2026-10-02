@@ -239,14 +239,17 @@ An **instance** is a short-lived copy of a VM. It runs on its own copy-on-write 
 
 | Method | Effect |
 |---|---|
-| `create_instance(name, snap_index, ram_mb=None, cpu_cores=None, auto_delete=None)` | Creates and starts an instance on snapshot `snap_index` (`-2` = the base, once snapshots exist). Returns `(202, {"name": "<vm>-<n>", ...})`. RAM and CPU default to the parent VM's. |
+| `create_instance(name, snap_index, ram_mb=None, cpu_cores=None, auto_delete=None, gpu_mode=None, network_mode=None, ttl_minutes=None, fast_stop=None)` | Creates and starts an instance on snapshot `snap_index` (`-2` = the base, once snapshots exist). Returns `(202, {"name": "<vm>-<n>", ...})`. Options left as `None` use the parent VM's value (RAM, CPU, GPU, network) or the daemon default (auto-delete, time limit, fast stop). `gpu_mode=0` gives an instance without a GPU. |
 | `instances(name=None)` | Live instances, optionally only those of VM `name`. |
 | `delete_vm(instance)` | Forces the instance off and deletes it. |
-| `settings()` / `set_settings(instanceAutoDelete=bool)` | Default for `auto_delete` (on unless changed; stored in `vms.cfg`). |
+| `settings()` / `set_settings(instanceAutoDelete=, instanceTtlMinutes=, instanceFastStop=)` | Defaults for new instances (stored in `vms.cfg`): auto-delete (on), time limit in minutes (0 = none), fast stop (off). |
 
 - **Using an instance:** use it like any VM: `status`, `wait`, `ssh_info`, `open_display`, `shutdown`/`stop`. Its status object adds `ephemeral: true`, `parent`, `snapIndex` and `autoDelete`.
 - **Deletion:** with `auto_delete` on, the instance's disk, folder and entry are deleted as soon as it stops. With it off, it stays (stopped) until `delete_vm`.
 - **Daemon restarts:** instances never survive one. Any left after a crash are cleaned up on the next start.
+- **Time limit (`ttl_minutes`):** the instance is forced off that many minutes after it was created (and deleted, if auto-delete is on). Status objects show `ttlMinutes` and `expiresAt` (unix time).
+- **Fast stop:** `shutdown()` forces the instance off instead of asking Windows to shut down. That's fine for a throwaway disk and saves the guest's shutdown time.
+- **GUI:** the snapshot dialog has **New Instance…**, the header has **Settings** for these defaults, and instance rows show their parent, auto-delete, fast stop and time left.
 - **What instances share:** the parent's settings (GPU, network mode, SSH key, `relayChannel`) and its guest image, so the guest's hostname is the same in every instance.
 - **What's refused while a VM has instances:** deleting its snapshots, and deleting any regular VM. Both return 409 `instances_running`.
 

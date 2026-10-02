@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <shlobj.h>
 #include <stdarg.h>
 #include <virtdisk.h>
@@ -172,6 +173,10 @@ static BOOL g_suppress_tray_warn = FALSE;
 /* fork: default for instances created without an explicit autoDelete
    ([Settings] InstanceAutoDelete=0|1; default 1). */
 static BOOL g_instance_auto_delete = TRUE;
+/* fork: defaults for instance time limit (minutes, 0 = none) and fast stop
+   ([Settings] InstanceTtlMinutes=, InstanceFastStop=). */
+static int  g_instance_ttl_minutes = 0;
+static BOOL g_instance_fast_stop = FALSE;
 
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
@@ -528,7 +533,8 @@ static void save_vm_list(void)
 
     if (_wfopen_s(&f, path, L"w,ccs=UTF-8") != 0 || !f) return;
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn || !g_instance_auto_delete) {
+    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn || !g_instance_auto_delete ||
+        g_instance_ttl_minutes || g_instance_fast_stop) {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
@@ -536,6 +542,10 @@ static void save_vm_list(void)
             fwprintf(f, L"SuppressTrayWarn=1\n");
         if (!g_instance_auto_delete)
             fwprintf(f, L"InstanceAutoDelete=0\n");   /* fork */
+        if (g_instance_ttl_minutes)
+            fwprintf(f, L"InstanceTtlMinutes=%d\n", g_instance_ttl_minutes);
+        if (g_instance_fast_stop)
+            fwprintf(f, L"InstanceFastStop=1\n");
         fwprintf(f, L"\n");
     }
 
@@ -697,6 +707,12 @@ static void load_vm_list(void)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
             else if (wcsncmp(line, L"InstanceAutoDelete=", 19) == 0)   /* fork */
                 g_instance_auto_delete = (_wtoi(line + 19) != 0);
+            else if (wcsncmp(line, L"InstanceTtlMinutes=", 19) == 0) {
+                int m = _wtoi(line + 19);
+                g_instance_ttl_minutes = (m > 0) ? m : 0;
+            }
+            else if (wcsncmp(line, L"InstanceFastStop=", 17) == 0)
+                g_instance_fast_stop = (_wtoi(line + 17) != 0);
             continue;
         }
 
@@ -3960,6 +3976,12 @@ ASB_API HRESULT asb_vm_shutdown(AsbVm vm)
 
     if (!inst->running) { asb_log(L"VM \"%s\" is not running.", inst->name); return S_FALSE; }
 
+    /* fork: a fast-stop instance has a throwaway disk, so skip the guest shutdown. */
+    if (inst->ephemeral && inst->fast_stop) {
+        asb_log(L"Instance \"%s\" uses fast stop: forcing it off.", inst->name);
+        return asb_vm_stop(vm);
+    }
+
     asb_log(L"Sending shutdown signal to \"%s\"...", inst->name);
     /* hcs_stop_vm fire-and-forgets the agent "shutdown" command (it does NOT wait
        for the reply -- see vm_agent_send), so this returns promptly and never
@@ -4335,9 +4357,56 @@ ASB_API BOOL asb_vm_relay_channel(AsbVm vm)
 
 /* ---- fork: throwaway instances ---- */
 
+/* Stops instances whose time limit has passed. Started with the first instance that
+   has one; checks every 5 seconds. */
+static DWORD WINAPI instance_ttl_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        ULONGLONG now;
+        int i;
+        Sleep(5000);
+        now = (ULONGLONG)time(NULL);
+        for (i = 0; i < g_vm_count; i++) {
+            VmInstance *v = &g_vms[i];
+            if (v->dead || !v->ephemeral || !v->running || !v->expires_at) continue;
+            if (now < v->expires_at) continue;
+            if (InterlockedCompareExchange(&v->ttl_fired, 1, 0) != 0) continue;
+            asb_log(L"Instance \"%s\" reached its %d-minute time limit; forcing it off.",
+                    v->name, v->ttl_minutes);
+            asb_vm_stop(vm_handle(v));
+        }
+    }
+}
+static volatile LONG g_ttl_thread_started = 0;
+
+ASB_API void asb_instance_options_init(AsbInstanceOptions *o)
+{
+    if (!o) return;
+    ZeroMemory(o, sizeof(*o));
+    o->snap_idx = -1;
+    o->gpu_mode = -1;
+    o->network_mode = -1;
+    o->auto_delete = -1;
+    o->ttl_minutes = -1;
+    o->fast_stop = -1;
+}
+
 ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
                                        DWORD cpu_cores, int auto_delete,
                                        wchar_t *out_name, size_t out_cap)
+{
+    AsbInstanceOptions o;
+    asb_instance_options_init(&o);
+    o.snap_idx = snap_idx;
+    o.ram_mb = ram_mb;
+    o.cpu_cores = cpu_cores;
+    o.auto_delete = auto_delete;
+    return asb_vm_create_instance_ex(parent, &o, out_name, out_cap);
+}
+
+ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions *opt,
+                                          wchar_t *out_name, size_t out_cap)
 {
     int pidx = vm_index_of(parent), slot = -1, n, i;
     VmInstance *p, *inst;
@@ -4346,8 +4415,12 @@ ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
     wchar_t name[256], root[MAX_PATH], inst_dir[MAX_PATH], snap_dir[MAX_PATH], vhdx[MAX_PATH];
     HRESULT hr;
 
+    int snap_idx;
     if (out_name && out_cap) out_name[0] = L'\0';
-    if (pidx < 0) return E_INVALIDARG;
+    if (pidx < 0 || !opt) return E_INVALIDARG;
+    snap_idx = opt->snap_idx;
+    if (opt->gpu_mode < -1 || opt->gpu_mode > GPU_DEFAULT) return E_INVALIDARG;
+    if (opt->network_mode < -1 || opt->network_mode > NET_INTERNAL) return E_INVALIDARG;
     p = &g_vms[pidx];
     t = &g_snap_trees[pidx];
     if (p->dead || p->ephemeral || p->is_template || p->building_vhdx || !p->install_complete)
@@ -4404,13 +4477,15 @@ ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
     wcscpy_s(inst->os_type, 32, p->os_type);
     wcscpy_s(inst->vhdx_path, MAX_PATH, vhdx);
     wcscpy_s(inst->image_path, MAX_PATH, p->image_path);
-    inst->ram_mb = ram_mb ? ram_mb : p->ram_mb;
+    inst->ram_mb = opt->ram_mb ? opt->ram_mb : p->ram_mb;
     inst->hdd_gb = p->hdd_gb;
-    inst->cpu_cores = cpu_cores ? cpu_cores : p->cpu_cores;
-    inst->gpu_mode = p->gpu_mode;
-    wcscpy_s(inst->gpu_name, 256, p->gpu_name);
-    wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), p->gpu_id);
-    inst->network_mode = p->network_mode;
+    inst->cpu_cores = opt->cpu_cores ? opt->cpu_cores : p->cpu_cores;
+    inst->gpu_mode = (opt->gpu_mode >= 0) ? opt->gpu_mode : p->gpu_mode;
+    if (inst->gpu_mode != GPU_NONE) {
+        wcscpy_s(inst->gpu_name, 256, p->gpu_name);
+        wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), p->gpu_id);
+    }
+    inst->network_mode = (opt->network_mode >= 0) ? opt->network_mode : p->network_mode;
     wcscpy_s(inst->net_adapter, 256, p->net_adapter);
     /* mac_address and nat_ip stay empty: each instance gets its own on start. */
     wcscpy_s(inst->resources_iso_path, MAX_PATH, p->resources_iso_path);
@@ -4422,7 +4497,11 @@ ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
     wcscpy_s(inst->ssh_pubkey, 512, p->ssh_pubkey);
     inst->relay_channel = p->relay_channel;
     inst->ephemeral = TRUE;
-    inst->auto_delete = (auto_delete < 0) ? g_instance_auto_delete : (auto_delete != 0);
+    inst->auto_delete = (opt->auto_delete < 0) ? g_instance_auto_delete : (opt->auto_delete != 0);
+    inst->fast_stop = (opt->fast_stop < 0) ? g_instance_fast_stop : (opt->fast_stop != 0);
+    inst->ttl_minutes = (opt->ttl_minutes < 0) ? g_instance_ttl_minutes : opt->ttl_minutes;
+    inst->expires_at = inst->ttl_minutes > 0
+        ? (ULONGLONG)time(NULL) + (ULONGLONG)inst->ttl_minutes * 60 : 0;
     inst->instance_snap = snap_idx;
     wcscpy_s(inst->parent_name, 256, p->name);
     snapshot_init(&g_snap_trees[slot], snap_dir);
@@ -4430,8 +4509,13 @@ ASB_API HRESULT asb_vm_create_instance(AsbVm parent, int snap_idx, DWORD ram_mb,
 
     instance_set_access(inst, TRUE);
     save_vm_list();
-    asb_log(L"Instance \"%s\" created from \"%s\" (snapshot %d, auto-delete %s).",
-            name, p->name, snap_idx, inst->auto_delete ? L"on" : L"off");
+    asb_log(L"Instance \"%s\" created from \"%s\" (snapshot %d, auto-delete %s, time limit %d min, fast stop %s).",
+            name, p->name, snap_idx, inst->auto_delete ? L"on" : L"off",
+            inst->ttl_minutes, inst->fast_stop ? L"on" : L"off");
+    if (inst->ttl_minutes > 0 && InterlockedCompareExchange(&g_ttl_thread_started, 1, 0) == 0) {
+        HANDLE th = CreateThread(NULL, 0, instance_ttl_thread, NULL, 0, NULL);
+        if (th) CloseHandle(th); else g_ttl_thread_started = 0;
+    }
 
     hr = asb_vm_start(vm_handle(inst), -1, -1, NULL);
     if (FAILED(hr)) {
@@ -4454,6 +4538,19 @@ ASB_API BOOL asb_get_instance_auto_delete(void) { return g_instance_auto_delete;
 ASB_API void asb_set_instance_auto_delete(BOOL enabled)
 {
     g_instance_auto_delete = enabled ? TRUE : FALSE;
+    save_vm_list();
+}
+
+ASB_API int  asb_get_instance_ttl_minutes(void) { return g_instance_ttl_minutes; }
+ASB_API void asb_set_instance_ttl_minutes(int minutes)
+{
+    g_instance_ttl_minutes = minutes > 0 ? minutes : 0;
+    save_vm_list();
+}
+ASB_API BOOL asb_get_instance_fast_stop(void) { return g_instance_fast_stop; }
+ASB_API void asb_set_instance_fast_stop(BOOL enabled)
+{
+    g_instance_fast_stop = enabled ? TRUE : FALSE;
     save_vm_list();
 }
 

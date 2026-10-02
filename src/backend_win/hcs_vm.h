@@ -128,6 +128,10 @@ typedef struct {
     wchar_t     parent_name[256];
     volatile LONG deleting;              /* 1 once deletion has started (runs once) */
     BOOL        dead;                    /* freed slot: skipped everywhere, reused by the next instance */
+    int         ttl_minutes;             /* fork: forced off this long after creation (0 = no limit) */
+    ULONGLONG   expires_at;              /* fork: unix time the limit hits (0 = none) */
+    volatile LONG ttl_fired;             /* fork: 1 once the limit has stopped it */
+    BOOL        fast_stop;               /* fork: shutdown = force off (throwaway disk) */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

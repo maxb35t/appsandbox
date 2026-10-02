@@ -39,7 +39,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force out\web | Out-Null
           Copy-Item bin\Release\AppSandbox.exe, bin\Release\appsandbox_core.dll out\
-          Copy-Item web\app.js out\web\
+          Copy-Item web\* out\web\
           Get-ChildItem out -File -Recurse -Exclude SHA256SUMS.txt | ForEach-Object {
             '{0}  {1}  {2}' -f (Get-FileHash $_.FullName).Hash, $_.VersionInfo.FileVersion, $_.Name
           } | Tee-Object -FilePath out\SHA256SUMS.txt

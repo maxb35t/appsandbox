@@ -6,6 +6,9 @@ let vms = [];
 let selectedVm = -1;
 let selectedSnap = new Map();
 let editVmState = null;
+/* fork: app-wide settings (instance defaults), from vmListChanged/fullState */
+let appSettings = { instanceAutoDelete: true, instanceTtlMinutes: 0, instanceFastStop: false };
+let instanceModal = null;
 let snapshotModal = null;
 let pendingConfirm = null; /* {resolve} */
 let minSizeReported = false;
@@ -135,7 +138,7 @@ window.onHostMessage = function(msg) {
     if (!msg || typeof msg !== 'object') return;
     switch (msg.type) {
         case 'fullState':     onFullState(msg); break;
-        case 'vmListChanged': updateVmList(msg.vms); renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
+        case 'vmListChanged': if (msg.settings) appSettings = msg.settings; updateVmList(msg.vms); renderVmTable(); updateHostInfo(msg.hostInfo); revalidateVmName(); break;
         case 'vmStateChanged': onVmStateChanged(msg); break;
         case 'snapListChanged': break; /* snapshots now inline in vmListChanged */
         case 'log':           appendLog(msg.message); break;
@@ -165,6 +168,7 @@ if (hostBridge.isWebView2) {
 /* ---- Initial state ---- */
 
 function onFullState(msg) {
+    if (msg.settings) appSettings = msg.settings;
     updateVmList(msg.vms || []);
     renderVmTable();
     revalidateVmName();
@@ -1018,7 +1022,7 @@ function buildRowCells(vm, i, statusTd) {
     }
 
     var cells = [
-        makeCell(vm.name),
+        vm.ephemeral ? instanceNameCell(vm) : makeCell(vm.name),
         makeCell(vm.osType),
         statusTd,
         agentTd,
@@ -1033,7 +1037,9 @@ function buildRowCells(vm, i, statusTd) {
             hostBridge.isMac ? 'NAT (shared networking)'
                 : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
     ];
-    if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
+    if (!hostBridge.isMac) cells.push(vm.ephemeral
+        ? makeCell('(instance)', 'Instances run on their own throwaway disk and have no snapshots')
+        : makeSnapCell(vm, i));
     cells.push(
         makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(i); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
         makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'),
@@ -1041,7 +1047,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(i); }, '', 'Edit VM configuration — VM must be stopped'),
+        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld && !vm.ephemeral, function() { openEditVmModal(i); }, '', vm.ephemeral ? 'Instances are configured when they are created' : 'Edit VM configuration — VM must be stopped'),
     );
     return cells;
 }
@@ -1051,7 +1057,7 @@ function renderVmTable() {
     renderSnapshotModal();
     var tbody = document.getElementById('vm-tbody');
 
-    if (vms.length === 0) {
+    if (!vms.some(function(vm) { return !vm.hidden; })) {
         rowCache = {};
         rowSigCache = {};
         tbody.innerHTML = '';
@@ -1071,7 +1077,7 @@ function renderVmTable() {
 
     /* Drop cached rows for VMs that no longer exist. */
     var seen = {};
-    vms.forEach(function(vm) { seen[vm.name] = true; });
+    vms.forEach(function(vm) { if (!vm.hidden) seen[vm.name] = true; });
     Object.keys(rowCache).forEach(function(name) {
         if (!seen[name]) {
             var stale = rowCache[name];
@@ -1091,7 +1097,10 @@ function renderVmTable() {
 
     /* Skip the cell rebuild when button-relevant fields are unchanged; the
      * install progress tick would otherwise destroy the button DOM mid-click. */
+    var pos = -1;   /* fork: table position; hidden (freed instance) entries keep their index i */
     vms.forEach(function(vm, i) {
+        if (vm.hidden) return;
+        pos++;
         var tr = rowCache[vm.name];
         var firstBuild = !tr;
         if (!tr) {
@@ -1115,19 +1124,20 @@ function renderVmTable() {
                actions (never on install-progress ticks — a VM can't be snapshotted
                while running), so the rebuild-skip optimization above is preserved. */
             vm.hasSnapshots, vm.snapCurrent, vm.snapCurrentBranch,
-            JSON.stringify(vm.snapshots || []), JSON.stringify(vm.baseBranches || [])
+            JSON.stringify(vm.snapshots || []), JSON.stringify(vm.baseBranches || []),
+            vm.ephemeral, vm.autoDelete, vm.fastStop, instanceTimeLeft(vm)
         ].join('|');
 
         if (!firstBuild && rowSigCache[vm.name] === sig) {
-            if (tbody.children[i] !== tr) {
-                tbody.insertBefore(tr, tbody.children[i] || null);
+            if (tbody.children[pos] !== tr) {
+                tbody.insertBefore(tr, tbody.children[pos] || null);
             }
             return;
         }
         rowSigCache[vm.name] = sig;
 
         tr.className = (i === selectedVm ? 'selected ' : '') +
-                       (vm.running ? 'running' : 'stopped');
+                       (vm.running ? 'running' : 'stopped') + (vm.ephemeral ? ' instance-row' : '');
         tr.onclick = function(e) {
             if (e.target.closest('.icon-btn')) return;
             if (e.target.closest('.snap-cell')) return;
@@ -1145,10 +1155,120 @@ function renderVmTable() {
         }
         while (tr.children.length > cells.length) tr.removeChild(tr.lastChild);
 
-        if (tbody.children[i] !== tr) {
-            tbody.insertBefore(tr, tbody.children[i] || null);
+        if (tbody.children[pos] !== tr) {
+            tbody.insertBefore(tr, tbody.children[pos] || null);
         }
     });
+}
+
+/* ---- fork: instances ---- */
+
+/* "12m left" for an instance with a time limit, '' otherwise. */
+function instanceTimeLeft(vm) {
+    if (!vm.ephemeral || !vm.expiresAt) return '';
+    var secs = vm.expiresAt - Math.floor(Date.now() / 1000);
+    if (secs <= 0) return 'time up';
+    var m = Math.ceil(secs / 60);
+    return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm left' : m + 'm left';
+}
+setInterval(function() { if (vms.some(function(vm) { return vm.ephemeral && vm.expiresAt; })) renderVmTable(); }, 30000);
+
+function instanceNameCell(vm) {
+    var td = document.createElement('td');
+    td.textContent = vm.name;
+    var badge = document.createElement('span');
+    badge.className = 'instance-badge';
+    var parent = vms[vmIndexByName(vm.parent)];
+    var snapName = vm.instanceSnap === -2 ? 'base'
+        : (parent && parent.snapshots && parent.snapshots[vm.instanceSnap] ? parent.snapshots[vm.instanceSnap].name : 'snapshot ' + vm.instanceSnap);
+    var bits = ['\u21B3 ' + vm.parent];
+    if (vm.autoDelete) bits.push('auto-delete');
+    if (vm.fastStop) bits.push('fast stop');
+    var left = instanceTimeLeft(vm);
+    if (left) bits.push(left);
+    badge.textContent = bits.join(' \u00B7 ');
+    td.title = 'Throwaway instance of ' + vm.parent + ' (' + snapName + ')' +
+        (vm.ttlMinutes ? ', time limit ' + vm.ttlMinutes + ' min' : '') +
+        (vm.autoDelete ? '; deleted when it stops' : '; kept when it stops until you delete it');
+    td.appendChild(badge);
+    return td;
+}
+
+function openInstanceModal() {
+    if (!snapshotModal) return;
+    var vm = vms[vmIndexByName(snapshotModal.name)];
+    if (!vm || vm.ephemeral || !vm.hasSnapshots) return;
+    var p = snapshotSelection(vm, selectedSnap.get(vm.name) || 'current');
+    /* An instance needs a frozen disk: the selected snapshot, or the snapshot (or base) a selected branch is on. */
+    var snapIndex = (p.snapIndex >= 0 || p.snapIndex === -2) ? p.snapIndex : -2;
+    var snapName = snapIndex === -2 ? 'Base' : ((vm.snapshots || [])[snapIndex] || {}).name;
+    instanceModal = { name: vm.name, snapIndex: snapIndex };
+    document.getElementById('instance-title').textContent = 'New Instance of ' + vm.name;
+    document.getElementById('instance-source').textContent = 'From: ' + snapName +
+        '. Runs alongside the VM and other instances, on its own throwaway disk.';
+    document.getElementById('inst-ram').value = vm.ramMb;
+    document.getElementById('inst-cpu').value = vm.cpuCores;
+    document.getElementById('inst-gpu').value = '-1';
+    document.getElementById('inst-net').value = '-1';
+    document.getElementById('inst-ttl').value = appSettings.instanceTtlMinutes || 0;
+    document.getElementById('inst-autodelete').checked = !!appSettings.instanceAutoDelete;
+    document.getElementById('inst-faststop').checked = !!appSettings.instanceFastStop;
+    document.getElementById('instance-warn').textContent = '';
+    document.getElementById('instance-overlay').classList.add('active');
+    document.getElementById('btn-create-instance').focus();
+}
+
+function closeInstanceModal() {
+    instanceModal = null;
+    document.getElementById('instance-overlay').classList.remove('active');
+}
+
+function createInstance() {
+    if (!instanceModal) return;
+    var idx = vmIndexByName(instanceModal.name);
+    var ram = parseInt(document.getElementById('inst-ram').value, 10);
+    var cpu = parseInt(document.getElementById('inst-cpu').value, 10);
+    var ttl = parseInt(document.getElementById('inst-ttl').value, 10);
+    var warn = document.getElementById('instance-warn');
+    if (idx < 0) { closeInstanceModal(); return; }
+    if (!(ram >= 512)) { warn.textContent = 'RAM must be at least 512 MB.'; return; }
+    if (!(cpu >= 1)) { warn.textContent = 'CPU cores must be at least 1.'; return; }
+    if (!(ttl >= 0)) { warn.textContent = 'Time limit must be 0 or more minutes.'; return; }
+    sendCmd('createInstance', {
+        vmIndex: idx, snapIndex: instanceModal.snapIndex,
+        ramMb: alignRamMb(ram), cpuCores: cpu,
+        gpuMode: parseInt(document.getElementById('inst-gpu').value, 10),
+        networkMode: parseInt(document.getElementById('inst-net').value, 10),
+        ttlMinutes: ttl,
+        autoDelete: document.getElementById('inst-autodelete').checked,
+        fastStop: document.getElementById('inst-faststop').checked
+    });
+    closeInstanceModal();
+}
+
+/* ---- fork: settings ---- */
+
+function openSettingsModal() {
+    document.getElementById('set-autodelete').checked = !!appSettings.instanceAutoDelete;
+    document.getElementById('set-ttl').value = appSettings.instanceTtlMinutes || 0;
+    document.getElementById('set-faststop').checked = !!appSettings.instanceFastStop;
+    document.getElementById('settings-warn').textContent = '';
+    document.getElementById('settings-overlay').classList.add('active');
+}
+
+function closeSettingsModal() {
+    document.getElementById('settings-overlay').classList.remove('active');
+}
+
+function saveSettings() {
+    var ttl = parseInt(document.getElementById('set-ttl').value, 10);
+    if (!(ttl >= 0)) { document.getElementById('settings-warn').textContent = 'Time limit must be 0 or more minutes.'; return; }
+    sendCmd('setSettings', {
+        instanceAutoDelete: document.getElementById('set-autodelete').checked,
+        instanceTtlMinutes: ttl,
+        instanceFastStop: document.getElementById('set-faststop').checked
+    });
+    closeSettingsModal();
 }
 
 function makeCell(text, title) {
@@ -1536,6 +1656,7 @@ function renderSnapshotModal() {
     }
     var editable = !!(p.snapshot || p.branch);
     document.getElementById('btn-snapshot-create').disabled = disabled;
+    document.getElementById('btn-snapshot-instance').disabled = !vm.hasSnapshots || !!vm.buildingVhdx || !vm.installComplete;
     document.getElementById('btn-snapshot-rename').disabled = disabled || !editable;
     document.getElementById('btn-snapshot-delete').disabled = disabled || !editable;
 }
@@ -1563,7 +1684,7 @@ function snapshotActionIndex(context) {
 function takeSnapshot() {
     var context = snapshotActionContext();
     if (!context) return;
-    showModal('New Snapshot', 'Create a new snapshot of the base disk. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
+    showModal('New Snapshot', 'Snapshot the disk this VM is on. On a branch, the branch is frozen as the new snapshot and work continues on a fresh branch on top of it. Snapshots are frozen points in time that you can create independent branches and instances from.', 'Create', {
         confirmClass: 'primary',
         input: { label: 'Snapshot name:', value: 'Snapshot ' + ((context.vm.snapshots || []).length + 1) }
     }).then(function(result) {
