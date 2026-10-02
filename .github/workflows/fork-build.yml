@@ -1,0 +1,50 @@
+# maxb35t fork: build the host binaries (AppSandbox.exe + appsandbox_core.dll) for x64.
+# The fork only changes host-side code, so a fork install replaces just these two files in an
+# official release folder and keeps the release's signed drivers, guest agent and resources.
+name: fork build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      # AppSandbox.vcxproj's post-build step xcopies release\resources, which only exists in a
+      # full release build. An empty folder keeps the step from failing.
+      - name: Prepare post-build inputs
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force release\resources | Out-Null
+
+      # Built one after the other: AppSandbox links appsandbox_core.lib and the solution
+      # declares no dependency between the two projects.
+      - name: Build appsandbox_core.dll
+        run: msbuild AppSandbox.sln /t:AppSandboxCore /p:Configuration=Release /p:Platform=x64 /v:minimal
+
+      - name: Build AppSandbox.exe
+        run: msbuild AppSandbox.sln /t:AppSandbox /p:Configuration=Release /p:Platform=x64 /v:minimal
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item bin\Release\AppSandbox.exe, bin\Release\appsandbox_core.dll out\
+          Get-ChildItem out -File | ForEach-Object {
+            '{0}  {1}  {2}' -f (Get-FileHash $_.FullName).Hash, $_.VersionInfo.FileVersion, $_.Name
+          } | Tee-Object -FilePath out\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appsandbox-fork-x64-${{ github.sha }}
+          path: out\
+          if-no-files-found: error
