@@ -37,9 +37,10 @@ jobs:
       - name: Collect binaries
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force out | Out-Null
+          New-Item -ItemType Directory -Force out\web | Out-Null
           Copy-Item bin\Release\AppSandbox.exe, bin\Release\appsandbox_core.dll out\
-          Get-ChildItem out -File | ForEach-Object {
+          Copy-Item web\app.js out\web\
+          Get-ChildItem out -File -Recurse -Exclude SHA256SUMS.txt | ForEach-Object {
             '{0}  {1}  {2}' -f (Get-FileHash $_.FullName).Hash, $_.VersionInfo.FileVersion, $_.Name
           } | Tee-Object -FilePath out\SHA256SUMS.txt
 

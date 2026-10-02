@@ -186,7 +186,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 | `status(name)` | one VM's status (raises `KeyError` on 404) |
 | `ssh_info(name)` | `{host, port, user, sshState, enabled, keyDeployed}` (loopback-forwarded SSH; `sshState 4` = ready + key deployed) |
 | `templates()` | `[{name, osType}, …]` |
-| `snapshots(name)` | list of `{index, name, branchCount, branches:[…]}` |
+| `snapshots(name)` | list of `{index, name, parent, branchCount, branches:[…]}` (`parent` is maxb35t fork only: `-2` = the base, otherwise the parent snapshot's index) |
 | `snapshots_full(name)` | the above **plus** `current: {snapIndex, branchIndex}` |
 
 A **status object** has: `name, osType, state, running, agentOnline,
@@ -212,6 +212,14 @@ gpuMode, networkMode, displayOpen` (plus `relayChannel` on the maxb35t fork).
 | `snap_rename(name, index, new_name, branch_index=-1)` | rename a snapshot (or a branch with `branch_index`) |
 | `snap_delete(name, index)` | delete a snapshot |
 | `snap_delete_branch(name, index, branch_index)` | delete one branch |
+
+**maxb35t fork: chained snapshots.**
+- `snap_take` snapshots the disk the VM is **currently on**.
+  - **On a branch:** that branch's disk becomes the new frozen snapshot, layered on the branch's snapshot (or the base). The VM then continues on a new branch with the old branch's name.
+  - **On the base:** it behaves as upstream does, layering a new snapshot with a `Default Branch` on the base.
+  - Upstream always layered new snapshots on the base, so a branch's changes were silently left out.
+- Snapshots report their `parent`.
+- `snap_delete` returns **409 `snapshot_has_children`** while other snapshots are layered on that snapshot. Delete the children first.
 
 A **branch** is created by *starting from* a snapshot with a new name:
 `start(name, snap_index=2, branch_name="experiment")`. This mirrors the GUI,

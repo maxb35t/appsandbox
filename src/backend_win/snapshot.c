@@ -60,6 +60,7 @@ static BOOL get_branch_list(SnapshotTree *tree, int index,
  *    Name=Snapshot 1
  *    Vhdx=C:\...\snapshots\snapshot_def67890-....vhdx
  *    Created=<FILETIME as decimal uint64>
+ *    Parent=<parent snapshot guid>            (fork; absent = layered on the base)
  *    [Branch]
  *    Guid=ghi11111-...
  *    Name=2026-03-21 14:35:00
@@ -102,6 +103,8 @@ void snapshot_save(SnapshotTree *tree)
             ft.HighPart = tree->nodes[i].created.dwHighDateTime;
             fwprintf(f, L"Created=%llu\n", ft.QuadPart);
         }
+        if (tree->nodes[i].parent_guid[0] != L'\0')
+            fwprintf(f, L"Parent=%s\n", tree->nodes[i].parent_guid);
         fwprintf(f, L"\n");
 
         for (b = 0; b < tree->nodes[i].branch_count; b++) {
@@ -207,6 +210,8 @@ static void snapshot_load(SnapshotTree *tree)
             wcscpy_s(node->name, 128, line + 5);
         else if (wcsncmp(line, L"Vhdx=", 5) == 0)
             wcscpy_s(node->snap_vhdx, MAX_PATH, line + 5);
+        else if (wcsncmp(line, L"Parent=", 7) == 0)
+            wcscpy_s(node->parent_guid, 64, line + 7);
         else if (wcsncmp(line, L"Created=", 8) == 0) {
             ULARGE_INTEGER ft;
             ft.QuadPart = _wcstoui64(line + 8, NULL, 10);
@@ -237,6 +242,11 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     wchar_t branch_guid[64];
     wchar_t vhdx_path[MAX_PATH];
     wchar_t branch_path[MAX_PATH];
+    wchar_t parent_guid[64] = L"";
+    wchar_t branch_name[128] = L"Default Branch";
+    wchar_t frozen_from[MAX_PATH] = L"";   /* branch disk renamed into the snapshot, if any */
+    const wchar_t *parent_vhdx;
+    int cur_snap = -1, cur_branch = -1, i;
     HRESULT hr;
 
     if (!tree || !instance || !name)
@@ -255,17 +265,63 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     generate_guid_string(snap_guid, 64);
     swprintf_s(vhdx_path, MAX_PATH, L"%s\\snapshot_%s.vhdx", tree->base_dir, snap_guid);
 
-    hr = vhdx_create_differencing(vhdx_path, tree->base_vhdx);
-    if (FAILED(hr)) return hr;
+    /* fork: snapshot where the VM actually is. */
+    snapshot_find_current(tree, instance->vhdx_path, &cur_snap, &cur_branch);
+    if (cur_branch >= 0) {
+        /* On a branch. A branch is a leaf (nothing is layered on it), so its disk can be
+           renamed into the frozen snapshot disk; work then continues on a new branch. */
+        BranchEntry *branches;
+        int *branch_count;
+        const wchar_t *unused_parent;
+        if (!get_branch_list(tree, cur_snap, &branches, &branch_count, &unused_parent))
+            return E_INVALIDARG;
+        if (cur_snap >= 0)
+            wcscpy_s(parent_guid, 64, tree->nodes[cur_snap].guid);
+        if (branches[cur_branch].friendly_name[0] != L'\0')
+            wcscpy_s(branch_name, 128, branches[cur_branch].friendly_name);
+        wcscpy_s(frozen_from, MAX_PATH, branches[cur_branch].vhdx_path);
+        if (!MoveFileExW(frozen_from, vhdx_path, 0))
+            return HRESULT_FROM_WIN32(GetLastError());
+    } else {
+        /* On the base, a frozen snapshot disk, or an unknown disk: layer a new, empty
+           snapshot on it (on the base this is exactly upstream's behaviour). */
+        parent_vhdx = tree->base_vhdx;
+        for (i = 0; i < tree->count; i++) {
+            if (tree->nodes[i].valid &&
+                _wcsicmp(instance->vhdx_path, tree->nodes[i].snap_vhdx) == 0) {
+                parent_vhdx = tree->nodes[i].snap_vhdx;
+                wcscpy_s(parent_guid, 64, tree->nodes[i].guid);
+                break;
+            }
+        }
+        hr = vhdx_create_differencing(vhdx_path, parent_vhdx);
+        if (FAILED(hr)) return hr;
+    }
 
-    /* Auto-create first branch with GUID filename */
+    /* First branch of the new snapshot, with GUID filename */
     generate_guid_string(branch_guid, 64);
     swprintf_s(branch_path, MAX_PATH, L"%s\\branch_%s.vhdx", tree->base_dir, branch_guid);
 
     hr = vhdx_create_differencing(branch_path, vhdx_path);
     if (FAILED(hr)) {
-        DeleteFileW(vhdx_path);
+        if (frozen_from[0] != L'\0')
+            MoveFileExW(vhdx_path, frozen_from, 0);   /* put the branch disk back */
+        else
+            DeleteFileW(vhdx_path);
         return hr;
+    }
+
+    /* The frozen branch is now the snapshot: drop it from its old branch list. */
+    if (frozen_from[0] != L'\0') {
+        BranchEntry *branches;
+        int *branch_count;
+        const wchar_t *unused_parent;
+        if (get_branch_list(tree, cur_snap, &branches, &branch_count, &unused_parent)) {
+            for (i = cur_branch; i < *branch_count - 1; i++)
+                branches[i] = branches[i + 1];
+            ZeroMemory(&branches[*branch_count - 1], sizeof(BranchEntry));
+            (*branch_count)--;
+        }
     }
 
     /* Record snapshot */
@@ -274,12 +330,13 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     wcscpy_s(node->guid, 64, snap_guid);
     wcscpy_s(node->name, 128, name);
     wcscpy_s(node->snap_vhdx, MAX_PATH, vhdx_path);
+    wcscpy_s(node->parent_guid, 64, parent_guid);
     GetSystemTimeAsFileTime(&node->created);
     node->valid = TRUE;
 
     /* Record first branch */
     wcscpy_s(node->branches[0].guid, 64, branch_guid);
-    wcscpy_s(node->branches[0].friendly_name, 128, L"Default Branch");
+    wcscpy_s(node->branches[0].friendly_name, 128, branch_name);
     wcscpy_s(node->branches[0].vhdx_path, MAX_PATH, branch_path);
     node->branches[0].valid = TRUE;
     node->branch_count = 1;
@@ -371,6 +428,9 @@ HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index)
     if (!tree || !instance) return E_INVALIDARG;
     if (index < 0 || index >= tree->count) return E_INVALIDARG;
     if (!tree->nodes[index].valid) return E_NOT_VALID_STATE;
+    /* fork: never delete a disk other snapshots are layered on. */
+    if (snapshot_has_children(tree, index))
+        return HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY);
 
     /* Check if currently on any of this snapshot's branches */
     for (b = 0; b < tree->nodes[index].branch_count; b++) {
@@ -552,4 +612,32 @@ HRESULT snapshot_rename(SnapshotTree *tree, int snap_idx, int branch_idx, const 
 
     snapshot_save(tree);
     return S_OK;
+}
+
+int snapshot_parent_index(SnapshotTree *tree, int index)
+{
+    int i;
+    if (!tree || index < 0 || index >= tree->count || !tree->nodes[index].valid)
+        return -1;
+    if (tree->nodes[index].parent_guid[0] == L'\0')
+        return -2;
+    for (i = 0; i < tree->count; i++) {
+        if (tree->nodes[i].valid &&
+            _wcsicmp(tree->nodes[i].guid, tree->nodes[index].parent_guid) == 0)
+            return i;
+    }
+    return -1;
+}
+
+BOOL snapshot_has_children(SnapshotTree *tree, int index)
+{
+    int i;
+    if (!tree || index < 0 || index >= tree->count || !tree->nodes[index].valid)
+        return FALSE;
+    for (i = 0; i < tree->count; i++) {
+        if (i != index && tree->nodes[i].valid &&
+            _wcsicmp(tree->nodes[i].parent_guid, tree->nodes[index].guid) == 0)
+            return TRUE;
+    }
+    return FALSE;
 }

@@ -1516,12 +1516,18 @@ function renderSnapshotModal() {
         var children = document.createElement('ul');
         base.appendChild(children);
         addBranches(children, vm.baseBranches || [], 'base-');
+        /* fork: snapshots can chain; nest each under its parent (parent -2 or missing = base).
+           Parents are always listed before their children, so one pass is enough. */
+        var snapLists = [];
         (vm.snapshots || []).forEach(function(snap, i) {
-            var item = addChoice(children, String(i), snap.name,
+            var parentList = (typeof snap.parent === 'number' && snap.parent >= 0 && snapLists[snap.parent])
+                ? snapLists[snap.parent] : children;
+            var item = addChoice(parentList, String(i), snap.name,
                 (snap.date ? 'Created ' + snap.date + ' · ' : '') + 'New branch on start');
             var branches = document.createElement('ul');
             item.appendChild(branches);
             addBranches(branches, snap.branches || [], i + '-');
+            snapLists[i] = branches;
         });
     }
     if (focusedValue !== null && !disabled) {
