@@ -634,10 +634,21 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
 
 static int handle_request(PHTTP_REQUEST req)
 {
-    const wchar_t *path = req->CookedUrl.pAbsPath ? req->CookedUrl.pAbsPath : L"/";
+    /* fork: pAbsPath runs on into the query string; cut it at AbsPathLength so routes
+       that take a query (e.g. /v1/proxy/log?vm=...) still match. */
+    static wchar_t path_buf[2048];
+    const wchar_t *path = L"/";
     HTTP_VERB verb = req->Verb;
     static char buf[ASB_MAX_VMS * 16384];
     int pos, i;
+
+    if (req->CookedUrl.pAbsPath) {
+        size_t n = req->CookedUrl.AbsPathLength / sizeof(wchar_t);
+        if (n >= ARRAYSIZE(path_buf)) n = ARRAYSIZE(path_buf) - 1;
+        wmemcpy(path_buf, req->CookedUrl.pAbsPath, n);
+        path_buf[n] = L'\0';
+        path = path_buf;
+    }
 
     /* /v1/version is open; everything else requires the token. */
     if (verb == HttpVerbGET && wcscmp(path, L"/v1/version") == 0) {

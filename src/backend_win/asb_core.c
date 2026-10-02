@@ -4732,7 +4732,13 @@ static void proxy_refresh(void)
         char name[512];
         GUID z = { 0 };
         if (v->dead || !v->running || v->network_mode != NET_PROXIED) continue;
-        if (memcmp(&v->runtime_id, &z, sizeof(GUID)) == 0) continue;
+        /* The id isn't always in the properties right after start (no "Cached VM
+           RuntimeId" line); fall back to the HCS enumeration, as the agent does. */
+        if (memcmp(&v->runtime_id, &z, sizeof(GUID)) == 0) hcs_find_runtime_id(v->name, &v->runtime_id);
+        if (memcmp(&v->runtime_id, &z, sizeof(GUID)) == 0) {
+            asb_log(L"Warning: no runtime id yet for \"%s\"; it has no proxy rules until the next refresh.", v->name);
+            continue;
+        }
         proxy_effective(v, &r);
         WideCharToMultiByte(CP_UTF8, 0, v->name, -1, name, sizeof(name), NULL, NULL);
         pos = proxy_append(buf, cap, pos,
