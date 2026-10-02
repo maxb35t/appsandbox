@@ -1053,6 +1053,21 @@ static DWORD WINAPI instance_delete_thread(LPVOID param)
     return 0;
 }
 
+/* Start deleting a stopped auto-delete instance on its own thread (deletion waits
+   for vmwp.exe to release the disk). Runs at most once per instance. Called from
+   the HCS exit event and from asb_vm_stop, which unregisters the HCS callback
+   before the exit event can arrive. */
+static void instance_schedule_delete(VmInstance *instance)
+{
+    UINT64 *id;
+    if (!instance->ephemeral || !instance->auto_delete) return;
+    if (InterlockedCompareExchange(&instance->deleting, 1, 0) != 0) return;
+    id = (UINT64 *)malloc(sizeof(UINT64));
+    if (!id) { instance->deleting = 0; return; }
+    *id = instance->unique_id;
+    CloseHandle(CreateThread(NULL, 0, instance_delete_thread, id, 0, NULL));
+}
+
 /* ---- HCS state callback (called from HCS worker thread) ---- */
 
 static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
@@ -1085,16 +1100,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 
             /* fork: an auto-delete instance goes away once it stops. Deletion waits for
                vmwp.exe to release the disk, so it runs on its own thread. */
-            if (instance->ephemeral && instance->auto_delete &&
-                InterlockedCompareExchange(&instance->deleting, 1, 0) == 0) {
-                UINT64 *id = (UINT64 *)malloc(sizeof(UINT64));
-                if (id) {
-                    *id = instance->unique_id;
-                    CloseHandle(CreateThread(NULL, 0, instance_delete_thread, id, 0, NULL));
-                } else {
-                    instance->deleting = 0;
-                }
-            }
+            instance_schedule_delete(instance);
 
             /* Template finalization */
             if (instance->is_template) {
@@ -4035,6 +4041,9 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     save_vm_list();
 
     if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
+    /* fork: the HCS callback is gone (hcs_close_vm above), so the exit event that
+       normally triggers auto-delete never arrives; do it here. */
+    instance_schedule_delete(inst);
     return S_OK;
 }
 

@@ -1181,7 +1181,7 @@ function instanceNameCell(vm) {
     var parent = vms[vmIndexByName(vm.parent)];
     var snapName = vm.instanceSnap === -2 ? 'base'
         : (parent && parent.snapshots && parent.snapshots[vm.instanceSnap] ? parent.snapshots[vm.instanceSnap].name : 'snapshot ' + vm.instanceSnap);
-    var bits = ['\u21B3 ' + vm.parent];
+    var bits = ['instance of ' + vm.parent];
     if (vm.autoDelete) bits.push('auto-delete');
     if (vm.fastStop) bits.push('fast stop');
     var left = instanceTimeLeft(vm);
@@ -1203,6 +1203,7 @@ function openInstanceModal() {
     var snapIndex = (p.snapIndex >= 0 || p.snapIndex === -2) ? p.snapIndex : -2;
     var snapName = snapIndex === -2 ? 'Base' : ((vm.snapshots || [])[snapIndex] || {}).name;
     instanceModal = { name: vm.name, snapIndex: snapIndex };
+    closeSnapshotModal();   /* the instance dialog replaces it */
     document.getElementById('instance-title').textContent = 'New Instance of ' + vm.name;
     document.getElementById('instance-source').textContent = 'From: ' + snapName +
         '. Runs alongside the VM and other instances, on its own throwaway disk.';
