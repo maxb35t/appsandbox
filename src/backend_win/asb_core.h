@@ -232,6 +232,25 @@ ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions
 ASB_API BOOL    asb_vm_is_listed(AsbVm vm);
 ASB_API BOOL    asb_get_instance_auto_delete(void);
 ASB_API void    asb_set_instance_auto_delete(BOOL enabled);
+/* ---- fork: Proxied network mode (NET_PROXIED) rules ----
+   custom FALSE = the VM uses the global defaults. ports: comma list of 1-65535. allow/deny:
+   comma lists of host names (a name matches itself and its subdomains; empty allow = any).
+   block_private refuses LAN, host, loopback and other non-public addresses after DNS. */
+typedef struct {
+    BOOL    custom;
+    BOOL    block_private;
+    wchar_t ports[128];
+    wchar_t allow[1024];
+    wchar_t deny[1024];
+    BOOL    log;
+} AsbProxyPolicy;
+ASB_API BOOL    asb_vm_get_proxy(AsbVm vm, AsbProxyPolicy *out);     /* effective rules */
+ASB_API HRESULT asb_vm_set_proxy(AsbVm vm, const AsbProxyPolicy *p); /* allowed while running */
+ASB_API void    asb_get_proxy_defaults(AsbProxyPolicy *out);
+ASB_API HRESULT asb_set_proxy_defaults(const AsbProxyPolicy *p);
+ASB_API int     asb_proxy_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap);
+ASB_API BOOL    asb_proxy_service_running(void);
+
 ASB_API int     asb_get_instance_ttl_minutes(void);
 ASB_API void    asb_set_instance_ttl_minutes(int minutes);
 ASB_API BOOL    asb_get_instance_fast_stop(void);

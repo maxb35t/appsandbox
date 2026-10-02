@@ -14,6 +14,7 @@
 #include "disk_util.h"
 #include "d3dlayers.h"
 #include "snapshot.h"
+#include "proxy_mgr.h"
 #include "vmms_cert.h"
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
@@ -177,6 +178,15 @@ static BOOL g_instance_auto_delete = TRUE;
    ([Settings] InstanceTtlMinutes=, InstanceFastStop=). */
 static int  g_instance_ttl_minutes = 0;
 static BOOL g_instance_fast_stop = FALSE;
+
+/* fork: default proxy rules for Proxied VMs ([Settings] Proxy*=). */
+static BOOL    g_proxy_block_private = TRUE;
+static wchar_t g_proxy_ports[128] = L"80,443";
+static wchar_t g_proxy_allow[1024] = L"";
+static wchar_t g_proxy_deny[1024] = L"";
+static BOOL    g_proxy_log = TRUE;
+
+static void proxy_refresh(void);   /* writes the proxy policy file (defined below) */
 
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
@@ -533,8 +543,7 @@ static void save_vm_list(void)
 
     if (_wfopen_s(&f, path, L"w,ccs=UTF-8") != 0 || !f) return;
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn || !g_instance_auto_delete ||
-        g_instance_ttl_minutes || g_instance_fast_stop) {
+    {   /* fork: [Settings] is always written now (it carries the proxy defaults) */
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
@@ -546,6 +555,11 @@ static void save_vm_list(void)
             fwprintf(f, L"InstanceTtlMinutes=%d\n", g_instance_ttl_minutes);
         if (g_instance_fast_stop)
             fwprintf(f, L"InstanceFastStop=1\n");
+        fwprintf(f, L"ProxyBlockPrivate=%d\n", g_proxy_block_private ? 1 : 0);
+        fwprintf(f, L"ProxyPorts=%s\n", g_proxy_ports);
+        fwprintf(f, L"ProxyAllow=%s\n", g_proxy_allow);
+        fwprintf(f, L"ProxyDeny=%s\n", g_proxy_deny);
+        fwprintf(f, L"ProxyLog=%d\n", g_proxy_log ? 1 : 0);
         fwprintf(f, L"\n");
     }
 
@@ -601,6 +615,14 @@ static void save_vm_list(void)
             fwprintf(f, L"SshDeployKey=1\n");
         if (g_vms[i].relay_channel)
             fwprintf(f, L"RelayChannel=1\n");
+        if (g_vms[i].proxy_custom) {   /* fork */
+            fwprintf(f, L"ProxyCustom=1\n");
+            fwprintf(f, L"ProxyBlockPrivate=%d\n", g_vms[i].proxy_block_private ? 1 : 0);
+            fwprintf(f, L"ProxyPorts=%s\n", g_vms[i].proxy_ports);
+            fwprintf(f, L"ProxyAllow=%s\n", g_vms[i].proxy_allow);
+            fwprintf(f, L"ProxyDeny=%s\n", g_vms[i].proxy_deny);
+            fwprintf(f, L"ProxyLog=%d\n", g_vms[i].proxy_log ? 1 : 0);
+        }
         if (g_vms[i].ssh_pubkey[0])
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
@@ -713,6 +735,16 @@ static void load_vm_list(void)
             }
             else if (wcsncmp(line, L"InstanceFastStop=", 17) == 0)
                 g_instance_fast_stop = (_wtoi(line + 17) != 0);
+            else if (wcsncmp(line, L"ProxyBlockPrivate=", 18) == 0)
+                g_proxy_block_private = (_wtoi(line + 18) != 0);
+            else if (wcsncmp(line, L"ProxyPorts=", 11) == 0)
+                wcsncpy_s(g_proxy_ports, 128, line + 11, _TRUNCATE);
+            else if (wcsncmp(line, L"ProxyAllow=", 11) == 0)
+                wcsncpy_s(g_proxy_allow, 1024, line + 11, _TRUNCATE);
+            else if (wcsncmp(line, L"ProxyDeny=", 10) == 0)
+                wcsncpy_s(g_proxy_deny, 1024, line + 10, _TRUNCATE);
+            else if (wcsncmp(line, L"ProxyLog=", 9) == 0)
+                g_proxy_log = (_wtoi(line + 9) != 0);
             continue;
         }
 
@@ -764,6 +796,18 @@ static void load_vm_list(void)
             vm->ssh_deploy_key = (_wtoi(line + 13) != 0);
         else if (wcsncmp(line, L"RelayChannel=", 13) == 0)
             vm->relay_channel = (_wtoi(line + 13) != 0);
+        else if (wcsncmp(line, L"ProxyCustom=", 12) == 0)
+            vm->proxy_custom = (_wtoi(line + 12) != 0);
+        else if (wcsncmp(line, L"ProxyBlockPrivate=", 18) == 0)
+            vm->proxy_block_private = (_wtoi(line + 18) != 0);
+        else if (wcsncmp(line, L"ProxyPorts=", 11) == 0)
+            wcsncpy_s(vm->proxy_ports, 128, line + 11, _TRUNCATE);
+        else if (wcsncmp(line, L"ProxyAllow=", 11) == 0)
+            wcsncpy_s(vm->proxy_allow, 1024, line + 11, _TRUNCATE);
+        else if (wcsncmp(line, L"ProxyDeny=", 10) == 0)
+            wcsncpy_s(vm->proxy_deny, 1024, line + 10, _TRUNCATE);
+        else if (wcsncmp(line, L"ProxyLog=", 9) == 0)
+            vm->proxy_log = (_wtoi(line + 9) != 0);
         else if (wcsncmp(line, L"Ephemeral=", 10) == 0)
             vm->ephemeral = (_wtoi(line + 10) != 0);
         else if (wcsncmp(line, L"Parent=", 7) == 0)
@@ -1039,6 +1083,7 @@ static HRESULT instance_destroy(VmInstance *inst)
     inst->dead = TRUE;
     LeaveCriticalSection(&g_cs);
     save_vm_list();
+    proxy_refresh();   /* fork: drop its entry (harmless if it had none) */
     asb_log(L"Instance \"%s\" deleted.", name);
     return hr;
 }
@@ -1097,6 +1142,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 
             asb_vm_cleanup_network(instance);
             hcs_close_vm(instance);
+            if (instance->network_mode == NET_PROXIED) proxy_refresh();   /* fork: drop its entry */
 
             /* fork: an auto-delete instance goes away once it stops. Deletion waits for
                vmwp.exe to release the disk, so it runs on its own thread. */
@@ -1164,7 +1210,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
 static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
 {
     int i;
-    if (mode == NET_NONE) return FALSE;
+    if (mode == NET_NONE || mode == NET_PROXIED) return FALSE;
     for (i = 0; i < g_vm_count; i++) {
         const VmInstance *v = &g_vms[i];
         if (v == self) continue;
@@ -1179,7 +1225,7 @@ static BOOL another_vm_uses_network_mode(const VmInstance *self, int mode)
 ASB_API void asb_vm_cleanup_network(VmInstance *vm)
 {
     if (!vm) return;
-    if (vm->network_mode == NET_NONE) return;
+    if (vm->network_mode == NET_NONE || vm->network_mode == NET_PROXIED) return;
     if (vm->network_cleaned) return;
     hcn_delete_endpoint(&vm->endpoint_id);
     /* The HCN network is shared across all VMs of the same mode
@@ -1387,6 +1433,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
+        if (vm->network_mode == NET_PROXIED) proxy_refresh();   /* fork: runtime id now known */
         /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
            per-OS to the correct HV-socket service GUID, and the in-VM
            agent listens on AF_HYPERV (Windows) or AF_VSOCK (Linux). */
@@ -3874,7 +3921,18 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
     if (resolve_vm_gpu_selection(inst)) save_vm_list();
-    if (inst->network_mode != NET_NONE) {
+    if (inst->network_mode == NET_PROXIED) {
+        /* fork: the proxy service must be up before the guest relay connects. */
+        HRESULT phr = proxy_mgr_ensure_service();
+        if (FAILED(phr)) {
+            asb_log(L"Warning: the App Sandbox proxy service isn't running (0x%08X); \"%s\" will have no web access.", phr, inst->name);
+            if (phr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
+                asb_alert(L"asb-proxy.exe is missing next to AppSandbox.exe, so Proxied VMs have no web access.");
+            else if (phr == E_ACCESSDENIED)
+                asb_alert(L"The App Sandbox proxy service couldn't start (access denied). Its account (LocalService) must be able to read the App Sandbox folder: run icacls \"<App Sandbox folder>\" /reset /T as administrator.");
+        }
+    }
+    if (inst->network_mode != NET_NONE && inst->network_mode != NET_PROXIED) {
         HRESULT hr = ensure_vm_mac_address(inst);
         if (FAILED(hr)) return hr;
         if (hr == S_OK) save_vm_list();
@@ -3934,14 +3992,15 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.cpu_cores = inst->cpu_cores;
         args->config.gpu_mode = inst->gpu_mode;
         wcscpy_s(args->config.gpu_id, ARRAYSIZE(args->config.gpu_id), inst->gpu_id);
-        args->config.network_mode = inst->network_mode;
+        /* fork: Proxied = no adapter + the relay channel */
+        args->config.network_mode = (inst->network_mode == NET_PROXIED) ? NET_NONE : inst->network_mode;
         wcscpy_s(args->config.mac_address, ARRAYSIZE(args->config.mac_address), inst->mac_address);
         args->config.test_mode = inst->test_mode;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
-        args->config.relay_channel = inst->relay_channel;
+        args->config.relay_channel = inst->relay_channel || inst->network_mode == NET_PROXIED;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
-        args->network_mode = inst->network_mode;
+        args->network_mode = (inst->network_mode == NET_PROXIED) ? NET_NONE : inst->network_mode;
         inst->network_cleaned = FALSE;
         asb_log(L"Starting VM \"%s\" (background)...", inst->name);
         CloseHandle(CreateThread(NULL, 0, start_vm_thread, args, 0, NULL));
@@ -3961,6 +4020,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             return hr;
         }
         asb_log(L"VM \"%s\" started.", inst->name);
+        if (inst->network_mode == NET_PROXIED) proxy_refresh();   /* fork */
         vm_agent_start(inst);
         idd_probe_start(inst);
         hcs_start_monitor(inst);
@@ -4043,6 +4103,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     if (g_state_cb) g_state_cb(vm, FALSE, g_state_ud);
     /* fork: the HCS callback is gone (hcs_close_vm above), so the exit event that
        normally triggers auto-delete never arrives; do it here. */
+    if (inst->network_mode == NET_PROXIED) proxy_refresh();
     instance_schedule_delete(inst);
     return S_OK;
 }
@@ -4335,7 +4396,9 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     if (g_vms[idx].running) return E_ACCESSDENIED;
-    if (mode < 0 || mode > 3) return E_INVALIDARG;
+    if (mode < 0 || mode > NET_PROXIED) return E_INVALIDARG;
+    if (g_vms[idx].network_mode != mode && g_vms[idx].handle)
+        hcs_close_vm(&g_vms[idx]);   /* fork: rebuild the compute system (adapter / relay channel) */
     g_vms[idx].network_mode = mode;
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
@@ -4429,7 +4492,7 @@ ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions
     if (pidx < 0 || !opt) return E_INVALIDARG;
     snap_idx = opt->snap_idx;
     if (opt->gpu_mode < -1 || opt->gpu_mode > GPU_DEFAULT) return E_INVALIDARG;
-    if (opt->network_mode < -1 || opt->network_mode > NET_INTERNAL) return E_INVALIDARG;
+    if (opt->network_mode < -1 || opt->network_mode > NET_PROXIED) return E_INVALIDARG;
     p = &g_vms[pidx];
     t = &g_snap_trees[pidx];
     if (p->dead || p->ephemeral || p->is_template || p->building_vhdx || !p->install_complete)
@@ -4505,6 +4568,12 @@ ASB_API HRESULT asb_vm_create_instance_ex(AsbVm parent, const AsbInstanceOptions
     inst->ssh_deploy_key = p->ssh_deploy_key;
     wcscpy_s(inst->ssh_pubkey, 512, p->ssh_pubkey);
     inst->relay_channel = p->relay_channel;
+    inst->proxy_custom = p->proxy_custom;   /* fork: instances inherit the parent's proxy rules */
+    inst->proxy_block_private = p->proxy_block_private;
+    wcscpy_s(inst->proxy_ports, 128, p->proxy_ports);
+    wcscpy_s(inst->proxy_allow, 1024, p->proxy_allow);
+    wcscpy_s(inst->proxy_deny, 1024, p->proxy_deny);
+    inst->proxy_log = p->proxy_log;
     inst->ephemeral = TRUE;
     inst->auto_delete = (opt->auto_delete < 0) ? g_instance_auto_delete : (opt->auto_delete != 0);
     inst->fast_stop = (opt->fast_stop < 0) ? g_instance_fast_stop : (opt->fast_stop != 0);
@@ -4562,6 +4631,200 @@ ASB_API void asb_set_instance_fast_stop(BOOL enabled)
     g_instance_fast_stop = enabled ? TRUE : FALSE;
     save_vm_list();
 }
+
+/* ---- fork: proxy rules (NET_PROXIED) ---- */
+
+/* Keep only characters that are valid in host names and lists. The policy parser treats
+   '#' as a comment and newlines as separators, so nothing else may reach the file. */
+static void proxy_sanitize_list(const wchar_t *in, wchar_t *out, size_t cap)
+{
+    size_t n = 0;
+    if (!cap) return;
+    for (; in && *in && n + 1 < cap; in++) {
+        wchar_t c = *in;
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') ||
+            c == L'.' || c == L'-' || c == L'_' || c == L'*' || c == L':' || c == L',' || c == L' ')
+            out[n++] = c;
+    }
+    out[n] = L'\0';
+}
+
+static BOOL proxy_ports_valid(const wchar_t *p)
+{
+    int count = 0;
+    if (!p || !*p) return FALSE;
+    while (*p) {
+        long v = 0; int digits = 0;
+        while (*p == L' ') p++;
+        while (*p >= L'0' && *p <= L'9') { v = v * 10 + (*p - L'0'); digits++; p++; if (v > 65535) return FALSE; }
+        while (*p == L' ') p++;
+        if (!digits || v < 1) return FALSE;
+        count++;
+        if (*p == L',') { p++; continue; }
+        if (*p) return FALSE;
+    }
+    return count > 0;
+}
+
+static void proxy_effective(const VmInstance *v, AsbProxyPolicy *o)
+{
+    ZeroMemory(o, sizeof(*o));
+    o->custom = v ? v->proxy_custom : FALSE;
+    if (v && v->proxy_custom) {
+        o->block_private = v->proxy_block_private;
+        wcscpy_s(o->ports, 128, v->proxy_ports);
+        wcscpy_s(o->allow, 1024, v->proxy_allow);
+        wcscpy_s(o->deny, 1024, v->proxy_deny);
+        o->log = v->proxy_log;
+    } else {
+        o->block_private = g_proxy_block_private;
+        wcscpy_s(o->ports, 128, g_proxy_ports);
+        wcscpy_s(o->allow, 1024, g_proxy_allow);
+        wcscpy_s(o->deny, 1024, g_proxy_deny);
+        o->log = g_proxy_log;
+    }
+}
+
+static size_t proxy_append(char *buf, size_t cap, size_t pos, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    if (pos >= cap) return pos;
+    va_start(ap, fmt);
+    n = vsnprintf(buf + pos, cap - pos, fmt, ap);
+    va_end(ap);
+    return (n < 0 || (size_t)n >= cap - pos) ? cap : pos + (size_t)n;
+}
+
+static size_t proxy_append_rules(char *buf, size_t cap, size_t pos, const AsbProxyPolicy *r)
+{
+    char ports[256], allow[2048], deny[2048];
+    WideCharToMultiByte(CP_UTF8, 0, r->ports, -1, ports, sizeof(ports), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, r->allow, -1, allow, sizeof(allow), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, r->deny, -1, deny, sizeof(deny), NULL, NULL);
+    return proxy_append(buf, cap, pos, "block_private=%d\nports=%s\nallow=%s\ndeny=%s\nlog=%d\n",
+                        r->block_private ? 1 : 0, ports, allow, deny, r->log ? 1 : 0);
+}
+
+/* Rewrites the proxy policy: [default] = global rules (unknown VMs refused), plus one
+   section per running Proxied VM, keyed by its HCS runtime id (the id the proxy sees on
+   each Hyper-V socket connection). */
+static void proxy_refresh(void)
+{
+    static CRITICAL_SECTION cs;
+    static volatile LONG cs_init = 0;
+    size_t cap = 256 * 1024, pos = 0;
+    char *buf;
+    AsbProxyPolicy d;
+    int i;
+
+    if (InterlockedCompareExchange(&cs_init, 1, 0) == 0) InitializeCriticalSection(&cs), cs_init = 2;
+    while (cs_init != 2) Sleep(1);
+    buf = (char *)malloc(cap);
+    if (!buf) return;
+    EnterCriticalSection(&cs);
+    proxy_effective(NULL, &d);
+    pos = proxy_append(buf, cap, pos, "# asb-proxy policy v1, written by App Sandbox (changes are overwritten)\n[default]\nallow_unknown=0\nmax_conns=64\n");
+    pos = proxy_append_rules(buf, cap, pos, &d);
+    for (i = 0; i < g_vm_count; i++) {
+        VmInstance *v = &g_vms[i];
+        AsbProxyPolicy r;
+        char name[512];
+        GUID z = { 0 };
+        if (v->dead || !v->running || v->network_mode != NET_PROXIED) continue;
+        /* The id isn't always in the properties right after start (no "Cached VM
+           RuntimeId" line); fall back to the HCS enumeration, as the agent does. */
+        if (memcmp(&v->runtime_id, &z, sizeof(GUID)) == 0) hcs_find_runtime_id(v->name, &v->runtime_id);
+        if (memcmp(&v->runtime_id, &z, sizeof(GUID)) == 0) {
+            asb_log(L"Warning: no runtime id yet for \"%s\"; it has no proxy rules until the next refresh.", v->name);
+            continue;
+        }
+        proxy_effective(v, &r);
+        WideCharToMultiByte(CP_UTF8, 0, v->name, -1, name, sizeof(name), NULL, NULL);
+        pos = proxy_append(buf, cap, pos,
+            "[vm %08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x]\nname=%s\n",
+            v->runtime_id.Data1, v->runtime_id.Data2, v->runtime_id.Data3,
+            v->runtime_id.Data4[0], v->runtime_id.Data4[1], v->runtime_id.Data4[2], v->runtime_id.Data4[3],
+            v->runtime_id.Data4[4], v->runtime_id.Data4[5], v->runtime_id.Data4[6], v->runtime_id.Data4[7], name);
+        pos = proxy_append_rules(buf, cap, pos, &r);
+    }
+    if (pos < cap) {
+        HRESULT hr = proxy_mgr_write_policy(buf);
+        if (FAILED(hr)) asb_log(L"Warning: couldn't write the proxy policy (0x%08X).", hr);
+    } else {
+        asb_log(L"Warning: proxy policy too large; not written.");
+    }
+    LeaveCriticalSection(&cs);
+    free(buf);
+}
+
+static HRESULT proxy_validate(const AsbProxyPolicy *p, AsbProxyPolicy *clean)
+{
+    if (!p || !proxy_ports_valid(p->ports)) return E_INVALIDARG;
+    *clean = *p;
+    proxy_sanitize_list(p->ports, clean->ports, 128);
+    proxy_sanitize_list(p->allow, clean->allow, 1024);
+    proxy_sanitize_list(p->deny, clean->deny, 1024);
+    return S_OK;
+}
+
+ASB_API BOOL asb_vm_get_proxy(AsbVm vm, AsbProxyPolicy *out)
+{
+    VmInstance *v = vm_inst(vm);
+    if (!v || v->dead || !out) return FALSE;
+    proxy_effective(v, out);
+    return TRUE;
+}
+
+ASB_API HRESULT asb_vm_set_proxy(AsbVm vm, const AsbProxyPolicy *p)
+{
+    int idx = vm_index_of(vm);
+    AsbProxyPolicy c;
+    if (idx < 0 || !p || g_vms[idx].dead) return E_INVALIDARG;
+    if (!p->custom) {
+        g_vms[idx].proxy_custom = FALSE;   /* back to the global defaults */
+    } else {
+        HRESULT hr = proxy_validate(p, &c);
+        if (FAILED(hr)) return hr;
+        g_vms[idx].proxy_custom = TRUE;
+        g_vms[idx].proxy_block_private = c.block_private;
+        wcscpy_s(g_vms[idx].proxy_ports, 128, c.ports);
+        wcscpy_s(g_vms[idx].proxy_allow, 1024, c.allow);
+        wcscpy_s(g_vms[idx].proxy_deny, 1024, c.deny);
+        g_vms[idx].proxy_log = c.log;
+    }
+    save_vm_list();
+    proxy_refresh();   /* applies to a running VM within ~2 s */
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API void asb_get_proxy_defaults(AsbProxyPolicy *out)
+{
+    if (out) proxy_effective(NULL, out);
+}
+
+ASB_API HRESULT asb_set_proxy_defaults(const AsbProxyPolicy *p)
+{
+    AsbProxyPolicy c;
+    HRESULT hr = proxy_validate(p, &c);
+    if (FAILED(hr)) return hr;
+    g_proxy_block_private = c.block_private;
+    wcscpy_s(g_proxy_ports, 128, c.ports);
+    wcscpy_s(g_proxy_allow, 1024, c.allow);
+    wcscpy_s(g_proxy_deny, 1024, c.deny);
+    g_proxy_log = c.log;
+    save_vm_list();
+    proxy_refresh();
+    return S_OK;
+}
+
+ASB_API int asb_proxy_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap)
+{
+    return proxy_mgr_read_log(vm_name, limit, out, cap);
+}
+
+ASB_API BOOL asb_proxy_service_running(void) { return proxy_mgr_service_running(); }
 
 /* ---- Snapshots ---- */
 

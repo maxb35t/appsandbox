@@ -36,3 +36,5 @@ To roll back, restore the two backed-up files.
 | Throwaway instances: several at once from one snapshot, auto-delete on stop (switchable per instance and globally) | done |
 | Headless display windows close when their VM stops or is deleted (upstream left them frozen) | done |
 | Instance options: GPU/network override, time limit, fast stop; GUI New Instance and Settings dialogs, instance rows | done |
+| asb-proxy: filtering proxy (tools/asb-proxy), the AppSandboxProxy service | done |
+| Proxied network mode (4): App Sandbox installs and starts the proxy service and writes per-VM rules; API | done |
