@@ -15,11 +15,11 @@
     <AsbVersionMajor>0</AsbVersionMajor>
     <AsbVersionMinor>1</AsbVersionMinor>
     <AsbVersionPatch>9</AsbVersionPatch>
-    <AsbVersionRevision>4</AsbVersionRevision>
+    <AsbVersionRevision>5</AsbVersionRevision>
 
     <!-- maxb35t fork: identifies fork builds in /v1/version (e.g. "0.1.9+mx.1"). Bump the
          number on every fork release; clear it to report the plain upstream version. -->
-    <AsbForkTag>mx.4</AsbForkTag>
+    <AsbForkTag>mx.5</AsbForkTag>
 
     <!-- Derived forms - do not edit. -->
     <AsbVersion>$(AsbVersionMajor).$(AsbVersionMinor).$(AsbVersionPatch).$(AsbVersionRevision)</AsbVersion>

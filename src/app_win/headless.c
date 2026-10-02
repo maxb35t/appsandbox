@@ -104,6 +104,30 @@ static void display_reap_stale(UINT64 vm_id)
     if (e && e->disp && !vm_display_idd_is_open(e->disp))
         display_drop(e);
 }
+/* fork: display windows close when their VM stops or is deleted. Upstream left them
+   frozen on the last frame ("Shutting down"). The table is shared by the request
+   thread and display_reaper_thread, so g_disp_cs guards it: the request loop holds it
+   for each request, and the reaper for each sweep. */
+static CRITICAL_SECTION g_disp_cs;
+
+static DWORD WINAPI display_reaper_thread(LPVOID unused)
+{
+    int i;
+    (void)unused;
+    while (!g_stop_all) {
+        Sleep(1000);
+        EnterCriticalSection(&g_disp_cs);
+        for (i = 0; i < ASB_MAX_VMS; i++) {
+            VmInstance *v;
+            if (!g_displays[i].vm_id) continue;
+            v = asb_find_vm_by_id(g_displays[i].vm_id);
+            if (!v || !v->running) display_drop(&g_displays[i]);
+        }
+        LeaveCriticalSection(&g_disp_cs);
+    }
+    return 0;
+}
+
 /* fork: drop display windows whose VM is gone (an auto-deleted instance). */
 static void display_sweep_orphans(void)
 {
@@ -1424,6 +1448,7 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     asb_set_progress_callback(progress_cb, NULL);
     asb_set_alert_callback(alert_cb, NULL);
 
+    InitializeCriticalSection(&g_disp_cs);   /* fork */
     bt = CreateThread(NULL, 0, bootstrap_thread, NULL, 0, NULL);
     if (!bt) { hlog(L"FATAL: bootstrap thread failed."); return 1; }
     while (!g_init_done) Sleep(25);
@@ -1436,13 +1461,20 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     req = (PHTTP_REQUEST)malloc(req_buf_len);
     if (!req) { hlog(L"OOM"); delete_discovery(); asb_cleanup(); return 1; }
 
+    {   /* fork: close display windows of stopped/deleted VMs */
+        HANDLE rt = CreateThread(NULL, 0, display_reaper_thread, NULL, 0, NULL);
+        if (rt) CloseHandle(rt);
+    }
+
     hlog(L"entering request loop.");
     while (!stop) {
         HTTP_REQUEST_ID reqId; ULONG bytes = 0, r;
         HTTP_SET_NULL_ID(&reqId);
         r = HttpReceiveHttpRequest(g_req_queue, reqId, 0, req, req_buf_len, &bytes, NULL);
         if (r == NO_ERROR) {
+            EnterCriticalSection(&g_disp_cs);   /* fork: display table shared with the reaper */
             stop = handle_request(req);
+            LeaveCriticalSection(&g_disp_cs);
         } else if (r == ERROR_MORE_DATA) {
             PHTTP_REQUEST grown;
             req_buf_len = bytes;
@@ -1468,7 +1500,9 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
     free(req);
 
+    EnterCriticalSection(&g_disp_cs);   /* fork: the reaper may be mid-sweep */
     { int i; for (i = 0; i < ASB_MAX_VMS; i++) display_drop(&g_displays[i]); }   /* close display windows */
+    LeaveCriticalSection(&g_disp_cs);
 
     /* The daemon OWNS its VMs: exit terminates them (asb_cleanup stops the
        per-VM monitor/agent/ssh-proxy threads, hcs_terminate_vm's every running
