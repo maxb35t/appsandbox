@@ -32,6 +32,14 @@ log() { echo "== $*"; }
 
 need_root() { [ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 1; }; }
 
+# The fork at REF (a branch, tag or full commit ID; `git clone --branch` takes only the first two).
+fetch_src() {
+    local ref=$1 dir=$2
+    git init -q "$dir"
+    git -C "$dir" fetch -q --depth 1 "$REPO" "$ref"
+    git -C "$dir" checkout -q FETCH_HEAD
+}
+
 make_slots() {
     local n=$1 i
     mkdir -p /srv/agents
@@ -93,7 +101,7 @@ cmd_jobs() {
 
     log "agent-job (from $REPO at $ref)"
     src=$(mktemp -d)
-    git clone -q --depth 1 --branch "$ref" "$REPO" "$src/appsandbox"
+    fetch_src "$ref" "$src/appsandbox"
     install -d "$LIB"
     install -m 644 "$src/appsandbox/tools/linux-env/agent-job.mjs" "$LIB/agent-job.mjs"
     rm -rf "$src"
@@ -139,7 +147,7 @@ P
 
     log "guest relay (asb-proxy from $REPO at $ref)"
     src=$(mktemp -d)
-    git clone -q --depth 1 --branch "$ref" "$REPO" "$src/appsandbox"
+    fetch_src "$ref" "$src/appsandbox"
     RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH \
         cargo build -q --release --manifest-path "$src/appsandbox/tools/asb-proxy/Cargo.toml"
     install -m 755 "$src/appsandbox/tools/asb-proxy/target/release/asb-proxy" /usr/local/bin/asb-proxy
