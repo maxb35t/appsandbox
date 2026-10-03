@@ -298,7 +298,7 @@ class Client:
     def run_ps(self, name, script, timeout=600):
         """Run a PowerShell script in a Windows VM over SSH (no quoting worries: the
         script is sent encoded). Returns (exit_code, stdout, stderr)."""
-        enc = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        enc = _ps_encode(script)
         if len(enc) > 7000:
             raise ValueError("script too long for one command line; put() it as a .ps1 and "
                              "run 'powershell -NoProfile -ExecutionPolicy Bypass -File <path>'")
@@ -336,17 +336,22 @@ class Client:
         rdir = "C:/ProgramData/asb-run/" + job
         wdir = rdir.replace("/", "\\")
         if powershell:
-            enc = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
-            line = "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + enc
+            line = ("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
+                    + _ps_encode(command))
         else:
             line = command
         local = tempfile.mkdtemp(prefix="asb-run-")
         try:
             folder = os.path.join(local, job)
             os.mkdir(folder)
+            # The command gets a file of its own, run by a separate cmd.exe: an `exit` in it
+            # ends only that cmd, `&` chains are redirected as a whole, and its exit code
+            # comes back in ERRORLEVEL.
+            with open(os.path.join(folder, "cmd.cmd"), "w", newline="\r\n") as f:
+                f.write("@echo off\n%s\n" % line)
             with open(os.path.join(folder, "job.cmd"), "w", newline="\r\n") as f:
-                f.write("@echo off\n%s > \"%s\\out.txt\" 2>&1\necho %%ERRORLEVEL%% > \"%s\\exit.txt\"\n"
-                        % (line, wdir, wdir))
+                f.write("@echo off\ncmd /d /c \"\"%s\\cmd.cmd\"\" > \"%s\\out.txt\" 2>&1\n"
+                        "echo %%ERRORLEVEL%% > \"%s\\exit.txt\"\n" % (wdir, wdir, wdir))
             with open(os.path.join(folder, "start.ps1"), "w", newline="\r\n") as f:
                 f.write(_DESKTOP_START.replace("@DIR@", wdir).replace("@JOB@", job)
                         .replace("@TIMEOUT@", str(int(timeout))))
@@ -374,12 +379,20 @@ class Client:
         return exit_code, rest
 
 
+def _ps_encode(script):
+    """-EncodedCommand form of a PowerShell script, with progress records switched off:
+    in a non-interactive PowerShell they come out as CLIXML noise on stderr."""
+    script = "$ProgressPreference = 'SilentlyContinue'\n" + script
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
 # Runs inside the VM (over SSH) for run_desktop: registers a one-off task as the user
 # logged on to the console, runs job.cmd in that desktop session, waits, prints the exit
 # code and the output, and removes the task and its folder.
 # Exit codes: 0 ran (exit code on line 1), 3 nobody logged on, 4 timed out.
 _DESKTOP_START = r"""
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 $dir = '@DIR@'
 $user = (Get-CimInstance Win32_ComputerSystem).UserName
 if (-not $user) { exit 3 }
