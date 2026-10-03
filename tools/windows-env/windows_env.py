@@ -115,7 +115,21 @@ class Instance:
 
 
 # Loads C:\job\.job-env into the environment, deletes it, then runs the command with cmd.exe.
+#
+# Certificate revocation: the instance has no network adapter, so Windows treats it as offline
+# and its certificate checker (used by Schannel, so by cargo, git and curl) never fetches
+# revocation data, even with the WinHTTP proxy set: every certificate whose revocation status
+# isn't already cached fails with CRYPT_E_REVOCATION_OFFLINE. So jobs skip that lookup: cargo
+# and git don't check revocation, and curl checks it best-effort. Certificates and host names
+# are still verified. A job's env file can override these.
 _RUN = r"""
+$env:CARGO_HTTP_CHECK_REVOKE = 'false'
+$env:GIT_CONFIG_COUNT = '1'
+$env:GIT_CONFIG_KEY_0 = 'http.schannelCheckRevoke'
+$env:GIT_CONFIG_VALUE_0 = 'false'
+$env:CURL_HOME = 'C:\job\.curl'
+New-Item -ItemType Directory -Force $env:CURL_HOME | Out-Null
+foreach ($n in '.curlrc', '_curlrc') { Set-Content -Path (Join-Path $env:CURL_HOME $n) -Value 'ssl-revoke-best-effort' -Encoding ascii }
 $f = 'C:\job\.job-env'
 if (Test-Path $f) {
     foreach ($l in Get-Content $f) {
@@ -253,6 +267,8 @@ def cmd_test(c, o):
         check(out.strip() == "200", "web through the proxy (google %s)" % out.strip())
         code, out = job(c, n, "curl.exe -s -m 20 http://192.168.1.1/")
         check("private-address" in out, "LAN refused by the host proxy (%r)" % out[:60])
+        code, out = job(c, n, 'curl.exe -sS -m 20 -o NUL -w "%{http_code}" https://index.crates.io/config.json')
+        check(out.strip() == "200", "HTTPS to a host whose revocation status isn't cached (crates.io %s)" % out.strip())
         code, out = job(c, n, "git clone -q --depth 1 https://github.com/octocat/Hello-World.git hw && dir /b hw")
         check(code == 0 and "README" in out, "git clone through the proxy (%r)" % out[-80:])
 
