@@ -1,0 +1,47 @@
+#!/bin/bash
+# maxb35t fork: run a command in an agent slot's sandbox.
+#
+#   sudo agent-run --slot N [--env-file FILE] [--] COMMAND [ARGS...]
+#
+# The command runs as user agentN, inside sandbox-runtime (bubblewrap + its own network
+# namespace): it can write only to /srv/agents/N, can't read the other slots, and reaches
+# the web only through the guest relay (and so the host proxy's rules). Every connection is
+# appended to /srv/agents/N/logs/network.log.
+#
+# --env-file FILE: KEY=VALUE lines added to the command's environment (e.g. a token for this
+# job). The file is read and then deleted, so the value never appears on a command line,
+# where other slots could see it in `ps`.
+set -euo pipefail
+
+usage() { sed -n '4,13p' "$0" >&2; exit 2; }
+[ "$(id -u)" = 0 ] || { echo "agent-run: run with sudo" >&2; exit 2; }
+
+slot= env_file=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --slot) slot=${2:-}; shift 2 ;;
+        --env-file) env_file=${2:-}; shift 2 ;;
+        --) shift; break ;;
+        -*) usage ;;
+        *) break ;;
+    esac
+done
+[[ "$slot" =~ ^[0-9]+$ ]] && [ $# -gt 0 ] || usage
+user="agent$slot" home="/srv/agents/$slot"
+id "$user" >/dev/null 2>&1 || { echo "agent-run: no slot $slot (setup.sh slots N)" >&2; exit 2; }
+
+# Job environment: copied into the slot (readable only by its user), removed by agent-run.mjs.
+job_env=
+if [ -n "$env_file" ]; then
+    job_env="$home/tmp/.job-env.$$"
+    install -o "$user" -g "$user" -m 600 "$env_file" "$job_env"
+    rm -f "$env_file"
+fi
+
+cd "$home/work"
+exec runuser -u "$user" -- env -i \
+    HOME="$home" USER="$user" LOGNAME="$user" SHELL=/bin/bash LANG=C.UTF-8 TERM="${TERM:-dumb}" \
+    PATH=/opt/rust/cargo/bin:/usr/local/bin:/usr/bin:/bin \
+    RUSTUP_HOME=/opt/rust/rustup CARGO_HOME="$home/.cargo" TMPDIR="$home/tmp" \
+    ASB_SLOT="$slot" ASB_JOB_ENV="$job_env" \
+    node /usr/local/lib/agent-run/agent-run.mjs "$@"

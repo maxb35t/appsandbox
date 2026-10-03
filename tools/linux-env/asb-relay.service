@@ -1,0 +1,20 @@
+# maxb35t fork: the guest side of App Sandbox's Proxied network mode. Listens on
+# 127.0.0.1:3128 and forwards each connection over vsock (channel port 8) to the
+# host's AppSandboxProxy, which applies the VM's rules.
+[Unit]
+Description=App Sandbox proxy relay (guest)
+After=network-pre.target
+
+[Service]
+ExecStart=/usr/local/bin/asb-proxy guest 127.0.0.1:3128 --port 8
+Restart=always
+RestartSec=2
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_VSOCK AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
