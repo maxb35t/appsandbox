@@ -18,12 +18,17 @@ port + bearer token so connect() takes no arguments. The API is IDENTICAL on
 both platforms; feature differences (snapshots/templates are Windows-only) are
 advertised in version()["capabilities"] and those routes return 501 on macOS.
 """
+import base64
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import urllib.error
+import uuid
 
 
 def _support_dir():
@@ -261,6 +266,156 @@ class Client:
 
     def wait_online(self, name, timeout=900):
         return self.wait(name, {"online"}, timeout=timeout)
+
+    # ---- maxb35t fork: commands and files over App Sandbox's SSH channel ----
+    # SSH reaches the VM over App Sandbox's own Hyper-V channel (not the network), with
+    # the key App Sandbox deploys (sshDeployKey). Nothing extra is installed in the VM.
+    # The VM must be running with SSH ready: ssh_info(name)["sshState"] == 4.
+
+    def _ssh_opts(self):
+        return ["-i", key_path(), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=" + os.devnull,
+                "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=15"]
+
+    def _ssh_target(self, name):
+        info = self.ssh_info(name)
+        if info.get("sshState") != 4:
+            raise RuntimeError("SSH to %s isn't ready (sshState=%s); wait for the VM to come online"
+                               % (name, info.get("sshState")))
+        return str(info["port"]), "%s@127.0.0.1" % info["user"]
+
+    def run(self, name, command, timeout=600, input=None):
+        """Run a command in VM `name` over SSH and wait for it. Returns
+        (exit_code, stdout, stderr) as text. The command goes to the guest's SSH shell
+        (cmd.exe on a stock Windows guest). It runs in the SSH session (session 0 on
+        Windows: no desktop and no GPU/Vulkan); use run_desktop() for those."""
+        port, target = self._ssh_target(name)
+        r = subprocess.run(["ssh"] + self._ssh_opts() + ["-p", port, target, command],
+                           input=input, capture_output=True, text=True, errors="replace",
+                           timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+
+    def run_ps(self, name, script, timeout=600):
+        """Run a PowerShell script in a Windows VM over SSH (no quoting worries: the
+        script is sent encoded). Returns (exit_code, stdout, stderr)."""
+        enc = _ps_encode(script)
+        if len(enc) > 7000:
+            raise ValueError("script too long for one command line; put() it as a .ps1 and "
+                             "run 'powershell -NoProfile -ExecutionPolicy Bypass -File <path>'")
+        return self.run(name, "powershell -NoProfile -NonInteractive -EncodedCommand " + enc,
+                        timeout=timeout)
+
+    def _scp(self, name, src, dst, timeout):
+        port, target = self._ssh_target(name)
+        src = src.replace("{t}", target)
+        dst = dst.replace("{t}", target)
+        r = subprocess.run(["scp", "-r", "-q"] + self._ssh_opts() + ["-P", port, src, dst],
+                           capture_output=True, text=True, errors="replace", timeout=timeout)
+        if r.returncode != 0:
+            raise RuntimeError("scp failed (%d): %s" % (r.returncode, r.stderr.strip()))
+
+    def put(self, name, local_path, remote_path, timeout=1800):
+        """Copy a local file or folder into VM `name` (scp over the SSH channel).
+        remote_path uses forward slashes, e.g. "C:/Users/User/work/repo"; the parent
+        folder must exist (create it with run_ps / run first)."""
+        self._scp(name, local_path, "{t}:" + remote_path, timeout)
+
+    def get(self, name, remote_path, local_path, timeout=1800):
+        """Copy a file or folder out of VM `name` to local_path."""
+        self._scp(name, "{t}:" + remote_path, local_path, timeout)
+
+    def run_desktop(self, name, command, timeout=600, powershell=False):
+        """Run a command in the logged-in desktop session of a Windows VM (session 1),
+        where the GPU, Vulkan and windows work -- unlike run(), whose SSH session has
+        none of them. It uses a one-off scheduled task (Windows' own schtasks support;
+        nothing is installed) that runs as the logged-on user, waits for it, and returns
+        (exit_code, output) with stdout and stderr combined.
+        `command` is a cmd.exe command line (or a PowerShell script with powershell=True).
+        Raises RuntimeError if no user is logged on to the desktop."""
+        job = "asb-" + uuid.uuid4().hex[:12]
+        rdir = "C:/ProgramData/asb-run/" + job
+        wdir = rdir.replace("/", "\\")
+        if powershell:
+            line = ("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
+                    + _ps_encode(command))
+        else:
+            line = command
+        local = tempfile.mkdtemp(prefix="asb-run-")
+        try:
+            folder = os.path.join(local, job)
+            os.mkdir(folder)
+            # The command gets a file of its own, run by a separate cmd.exe: an `exit` in it
+            # ends only that cmd, `&` chains are redirected as a whole, and its exit code
+            # comes back in ERRORLEVEL.
+            with open(os.path.join(folder, "cmd.cmd"), "w", newline="\r\n") as f:
+                f.write("@echo off\n%s\n" % line)
+            with open(os.path.join(folder, "job.cmd"), "w", newline="\r\n") as f:
+                f.write("@echo off\ncmd /d /c \"\"%s\\cmd.cmd\"\" > \"%s\\out.txt\" 2>&1\n"
+                        "echo %%ERRORLEVEL%% > \"%s\\exit.txt\"\n" % (wdir, wdir, wdir))
+            with open(os.path.join(folder, "start.ps1"), "w", newline="\r\n") as f:
+                f.write(_DESKTOP_START.replace("@DIR@", wdir).replace("@JOB@", job)
+                        .replace("@TIMEOUT@", str(int(timeout))))
+            code, out, err = self.run_ps(name, "New-Item -ItemType Directory -Force "
+                                         "'C:\\ProgramData\\asb-run' | Out-Null")
+            if code != 0:
+                raise RuntimeError("couldn't prepare the VM (%d): %s" % (code, err.strip()))
+            self.put(name, folder, "C:/ProgramData/asb-run/")
+        finally:
+            shutil.rmtree(local, ignore_errors=True)
+        code, out, err = self.run(name, "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                                  "-File \"%s\\start.ps1\"" % wdir, timeout=timeout + 60)
+        if code == 3:
+            raise RuntimeError("no user is logged on to %s's desktop" % name)
+        if code == 4:
+            raise TimeoutError("desktop command didn't finish within %d s" % timeout)
+        if code != 0:
+            raise RuntimeError("desktop run failed (%d): %s %s" % (code, out.strip(), err.strip()))
+        # start.ps1 prints the exit code on the first line, then the output.
+        first, _, rest = out.partition("\n")
+        try:
+            exit_code = int(first.strip())
+        except ValueError:
+            exit_code = -1
+        return exit_code, rest
+
+
+def _ps_encode(script):
+    """-EncodedCommand form of a PowerShell script, with progress records switched off:
+    in a non-interactive PowerShell they come out as CLIXML noise on stderr."""
+    script = "$ProgressPreference = 'SilentlyContinue'\n" + script
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
+# Runs inside the VM (over SSH) for run_desktop: registers a one-off task as the user
+# logged on to the console, runs job.cmd in that desktop session, waits, prints the exit
+# code and the output, and removes the task and its folder.
+# Exit codes: 0 ran (exit code on line 1), 3 nobody logged on, 4 timed out.
+_DESKTOP_START = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$dir = '@DIR@'
+$user = (Get-CimInstance Win32_ComputerSystem).UserName
+if (-not $user) { exit 3 }
+$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/c "' + $dir + '\job.cmd"')
+$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds (@TIMEOUT@ + 30)) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName '@JOB@' -TaskPath '\asb\' -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+try {
+    Start-ScheduledTask -TaskName '@JOB@' -TaskPath '\asb\'
+    $deadline = (Get-Date).AddSeconds(@TIMEOUT@)
+    while (-not (Test-Path "$dir\exit.txt")) {
+        if ((Get-Date) -gt $deadline) { Stop-ScheduledTask -TaskName '@JOB@' -TaskPath '\asb\'; exit 4 }
+        Start-Sleep -Milliseconds 300
+    }
+    Start-Sleep -Milliseconds 200
+    (Get-Content "$dir\exit.txt" -Raw).Trim()
+    if (Test-Path "$dir\out.txt") { Get-Content "$dir\out.txt" -Raw }
+} finally {
+    Unregister-ScheduledTask -TaskName '@JOB@' -TaskPath '\asb\' -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+}
+exit 0
+"""
 
 
 def connect(endpoint=None, token=None, check=True):

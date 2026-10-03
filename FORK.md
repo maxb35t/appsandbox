@@ -39,4 +39,5 @@ To roll back, restore the two backed-up files.
 | asb-proxy: filtering proxy (tools/asb-proxy), the AppSandboxProxy service | done |
 | Proxied network mode (4): App Sandbox installs and starts the proxy service and writes per-VM rules; API | done |
 | Proxy GUI: Proxied option in Edit and New Instance, per-VM proxy rules, proxy defaults in Settings, Proxy activity view | done |
+| `asb.py`: `run`, `run_ps`, `put`/`get` and `run_desktop` for commands and files in a VM over App Sandbox's SSH channel (no guest changes) | done |
 | GUI attach mode: opening App Sandbox while the headless daemon runs attaches to it (actions run in the daemon; closing the window leaves VMs running); internal routes `POST /v1/ui/action`, `GET /v1/ui/events` | done |
