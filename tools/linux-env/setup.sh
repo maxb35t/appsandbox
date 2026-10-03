@@ -40,6 +40,15 @@ fetch_src() {
     git -C "$dir" checkout -q FETCH_HEAD
 }
 
+# git and npm take the proxy from the environment (/etc/environment and profile.d here; inside a slot,
+# sandbox-runtime's own authenticated proxy). A proxy in their config files would win over the
+# environment and send slot traffic to sandbox-runtime's proxy without its login (407).
+tool_proxy_from_env() {
+    git config --system --unset-all http.proxy 2>/dev/null || true
+    npm config delete --global proxy 2>/dev/null || true
+    npm config delete --global https-proxy 2>/dev/null || true
+}
+
 make_slots() {
     local n=$1 i
     mkdir -p /srv/agents
@@ -83,6 +92,7 @@ userns_setup() {
 cmd_jobs() {
     local ref=${1:-main} src have t
     export DEBIAN_FRONTEND=noninteractive
+    tool_proxy_from_env
     log "GitHub CLI"
     command -v gh >/dev/null || { apt-get update -q; apt-get install -y -q gh; }
 
@@ -183,9 +193,7 @@ no_proxy=localhost,127.0.0.1,::1
 P
     echo "Acquire::http::Proxy \"http://$RELAY\"; Acquire::https::Proxy \"http://$RELAY\";" \
         > /etc/apt/apt.conf.d/95asb-proxy
-    git config --system http.proxy "http://$RELAY"
-    npm config set --global proxy "http://$RELAY"
-    npm config set --global https-proxy "http://$RELAY"
+    tool_proxy_from_env
     log "boot to the console (the desktop can be switched back on: systemctl set-default graphical.target)"
     systemctl set-default multi-user.target
     log "done. Set the VM's network to Proxied (4) in App Sandbox and restart it."

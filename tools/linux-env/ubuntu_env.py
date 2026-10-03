@@ -98,6 +98,8 @@ def cmd_test(c, vm):
     check(any("No such file" in l for l in lines), "slot 2's folder is hidden from slot 1")
     check("0" in lines, "shared /tmp hidden inside the sandbox")
     check(lines[-1:] == ["200"], "web from inside the sandbox (example.com %s)" % lines[-1:])
+    code, out = sh("sudo -n agent-run --slot 1 -- git ls-remote https://github.com/octocat/Hello-World HEAD")
+    check(code == 0 and "HEAD" in out, "git through sandbox-runtime's proxy (ls-remote %r)" % out[-60:])
     code, out = sh("sudo -n tail -n 5 /srv/agents/1/logs/network.log")
     check("example.com" in out, "slot 1's connection log has example.com")
     code, out = sh("sudo -n agent-run --slot 2 -- sh -c 'cat /srv/agents/1/work/probe 2>&1; "
