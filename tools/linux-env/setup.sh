@@ -10,11 +10,22 @@
 #                                    the VM's network to Proxied (4) in App Sandbox.
 #   setup.sh slots N                 make sure slots 1..N exist.
 #   setup.sh userns                  only the user-namespace settings srt needs (part of install).
+#   setup.sh jobs [REF]              only the engine job pieces (part of install): the GitHub CLI,
+#                                    Claude Code at exactly $CLAUDE_VERSION, the Rust toolchains in
+#                                    $RUST_TOOLCHAINS, and agent-job (engine ADR 0020). Re-run it to
+#                                    change the pinned versions on an existing VM.
 set -euo pipefail
 
 REPO=https://github.com/maxb35t/appsandbox
 RELAY=127.0.0.1:3128
 SRT_VERSION=0.0.78
+# Engine ADR 0020: jobs refuse to start unless Claude Code is the version the driver names, so the VM
+# carries exactly that version (the engine's pin), with auto-update off. A change is a new base snapshot.
+CLAUDE_VERSION=${CLAUDE_VERSION:-2.1.284}
+# Slots can't install toolchains (/opt/rust is read-only to them), so the engine's pinned toolchain
+# (rust-toolchain.toml) must already be here.
+RUST_TOOLCHAINS=${RUST_TOOLCHAINS:-"stable 1.98.1"}
+JOB_REPO=${JOB_REPO:-https://github.com/maxb35t/engine}
 LIB=/usr/local/lib/agent-run
 
 log() { echo "== $*"; }
@@ -60,6 +71,47 @@ userns_setup() {
     fi
 }
 
+# Engine agent jobs (ADR 0020): pinned Claude Code and Rust toolchains, the GitHub CLI and agent-job.
+cmd_jobs() {
+    local ref=${1:-main} src have t
+    export DEBIAN_FRONTEND=noninteractive
+    log "GitHub CLI"
+    command -v gh >/dev/null || { apt-get update -q; apt-get install -y -q gh; }
+
+    log "Claude Code $CLAUDE_VERSION (exact; npm checks the package against the registry's integrity hash)"
+    npm install -g -q "@anthropic-ai/claude-code@$CLAUDE_VERSION"
+    have=$(DISABLE_AUTOUPDATER=1 claude --version | awk '{print $1}')
+    [ "$have" = "$CLAUDE_VERSION" ] || { echo "Claude Code is $have, wanted $CLAUDE_VERSION" >&2; exit 1; }
+    grep -q '^DISABLE_AUTOUPDATER=' /etc/environment || echo 'DISABLE_AUTOUPDATER=1' >> /etc/environment
+
+    log "Rust toolchains: $RUST_TOOLCHAINS"
+    for t in $RUST_TOOLCHAINS; do
+        RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH \
+            rustup toolchain install -q "$t" --profile default -c rustfmt -c clippy
+    done
+    chmod -R a+rX /opt/rust
+
+    log "agent-job (from $REPO at $ref)"
+    src=$(mktemp -d)
+    git clone -q --depth 1 --branch "$ref" "$REPO" "$src/appsandbox"
+    install -d "$LIB"
+    install -m 644 "$src/appsandbox/tools/linux-env/agent-job.mjs" "$LIB/agent-job.mjs"
+    rm -rf "$src"
+    cat > /usr/local/bin/agent-job <<'P'
+#!/bin/sh
+# Engine agent jobs in slots (engine ADR 0020). Run with sudo; see agent-job.mjs.
+exec node /usr/local/lib/agent-run/agent-job.mjs "$@"
+P
+    chmod 755 /usr/local/bin/agent-job
+    install -d -m 700 /var/lib/agent-jobs /etc/agent-job
+    # The same rules as the engine's launcher config (ci/host/engine-agent/launcher-config.json).
+    cat > /etc/agent-job/config.json <<P
+{"repo":"$JOB_REPO","models":["opus","sonnet"],"efforts":["low","medium","high","xhigh","max"],"agents":["none"],"max_timeout_s":10800}
+P
+    chmod 600 /etc/agent-job/config.json
+    log "jobs ready: Claude Code $CLAUDE_VERSION, toolchains $RUST_TOOLCHAINS, repo $JOB_REPO"
+}
+
 cmd_install() {
     local ref=${1:-main} slots=${2:-4} src
     export DEBIAN_FRONTEND=noninteractive
@@ -67,7 +119,7 @@ cmd_install() {
     log "packages"
     apt-get update -q
     apt-get install -y -q bubblewrap socat ripgrep git build-essential pkg-config curl ca-certificates \
-        jq nodejs npm openssh-server
+        jq nodejs npm openssh-server gh
 
     userns_setup
 
@@ -95,9 +147,6 @@ P
     systemctl daemon-reload
     systemctl enable -q --now asb-relay.service
 
-    log "Claude Code CLI"
-    npm install -g -q @anthropic-ai/claude-code
-
     log "agent-run (sandbox-runtime $SRT_VERSION)"
     install -d "$LIB"
     install -m 644 "$src/appsandbox/tools/linux-env/agent-run.mjs" "$LIB/agent-run.mjs"
@@ -108,6 +157,7 @@ P
     rm -rf "$src"
 
     make_slots "$slots"
+    cmd_jobs "$ref"
     log "install done. Next: setup.sh proxied, then set the VM's network to Proxied."
 }
 
@@ -139,5 +189,6 @@ case "${1:-}" in
     proxied) cmd_proxied ;;
     slots)   make_slots "${2:?count}" ;;
     userns)  userns_setup ;;
-    *) sed -n '2,14p' "$0"; exit 2 ;;
+    jobs)    shift; cmd_jobs "$@" ;;
+    *) sed -n '2,17p' "$0"; exit 2 ;;
 esac

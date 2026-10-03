@@ -55,3 +55,28 @@ c.put("Ubuntu", r"C:\jobs\42\token.env", "jobs/42.env")
 code, out, err = c.run("Ubuntu", "sudo -n agent-run --slot 3 --env-file ~/jobs/42.env -- "
                                  "claude -p 'fix the failing test'")
 ```
+
+## Engine agent jobs: `agent-job` (engine ADR 0020)
+
+`sudo agent-job start --slot N --dir DIR` runs one engine agent job in slot N. It returns at once.
+
+`DIR` holds three files:
+- `job.json`: exactly `agent`, `claude_version`, `effort`, `job_id`, `model`, `timeout_s` and `workdir`;
+- `prompt.txt`;
+- `cred.env`: exactly `CLAUDE_CODE_OAUTH_TOKEN` and `GH_TOKEN`. It is deleted at start, whatever happens.
+
+The runner applies the same rules as the engine's Windows launcher (`ci/host/engine-agent/launcher.ps1`). In addition:
+- **It runs as systemd unit `agent-job-<job_id>`,** so stopping the unit kills everything the job started (its cgroup).
+- **Claude Code pin:** the job is refused unless `claude --version` is exactly `claude_version`.
+- **Slot wipe:** the slot is wiped (every `agentN` process killed, its home and its temp files removed) before and after the job, so nothing passes between jobs.
+- **Credentials:** they reach the job through `agent-run --env-file`, with a git credential helper that reads `GH_TOKEN` from the environment.
+- **Records:** they live in `/var/lib/agent-jobs/<job_id>/`, readable by root only, so the job can't forge them. They hold `status.json`, `result.json` (Claude's JSON output, at most 4 MiB), `stderr.txt` and the slot's `network.log`.
+
+`agent-job status|result|stop JOB_ID` read the records (bounded) or stop the job.
+
+`setup.sh jobs` installs all of this, the GitHub CLI, Claude Code at exactly `CLAUDE_VERSION` (default 2.1.284, the engine's pin) with auto-update off, and the Rust toolchains in `RUST_TOOLCHAINS` (default `stable 1.98.1`; slots can't install toolchains). `install` runs it too.
+
+`ubuntu_env.py jobtest VM [SLOT]` runs a real job with the agent's tokens and checks it:
+- the job clones the engine repo and `claude -p` answers;
+- the records are complete;
+- the slot is wiped, and no credential file or process is left.

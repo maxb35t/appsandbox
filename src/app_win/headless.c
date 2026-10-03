@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <wchar.h>
+#include <sddl.h>          /* fork: host.json DACL */
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
@@ -36,6 +37,7 @@
 #include "ui.h"                /* fork: serving an attached GUI (ui_served_*) */
 
 #pragma comment(lib, "httpapi.lib")
+#pragma comment(lib, "advapi32.lib")
 
 #define ASB_API_VERSION  "v1"
 /* Product version derives from Directory.Build.props (the single source of truth):
@@ -1623,18 +1625,62 @@ static void gen_token(void)
     g_token[40] = 0;
 }
 
+/* fork: host.json holds the API token, which controls an elevated program, so it is readable
+   only by SYSTEM, Administrators and the account that started App Sandbox (inherited, it was
+   readable by every local user). Built per write because the account's SID is only known at
+   run time; written with that DACL from creation (the old file is deleted first, because
+   CREATE_ALWAYS keeps an existing file's security). Returns FALSE if the file isn't written:
+   it fails closed rather than writing the token with inherited permissions. */
+static BOOL discovery_security(SECURITY_ATTRIBUTES *sa)
+{
+    HANDLE tok = NULL;
+    BYTE buf[256];
+    DWORD len = 0;
+    wchar_t *sid = NULL, sddl[256];
+    BOOL ok = FALSE;
+    sa->nLength = sizeof(*sa);
+    sa->bInheritHandle = FALSE;
+    sa->lpSecurityDescriptor = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return FALSE;
+    if (GetTokenInformation(tok, TokenUser, buf, sizeof(buf), &len) &&
+        ConvertSidToStringSidW(((TOKEN_USER *)buf)->User.Sid, &sid)) {
+        swprintf_s(sddl, 256, L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;%s)", sid);
+        ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1,
+                 &sa->lpSecurityDescriptor, NULL);
+        LocalFree(sid);
+    }
+    CloseHandle(tok);
+    return ok;
+}
+
 static void write_discovery(int port)
 {
-    wchar_t path[MAX_PATH]; FILE *f = NULL;
+    wchar_t path[MAX_PATH];
+    char body[512];
+    SECURITY_ATTRIBUTES sa;
+    HANDLE h;
+    DWORD written = 0;
+    int n;
     programdata_path(path, MAX_PATH, L"host.json");
-    if (_wfopen_s(&f, path, L"w") == 0 && f) {
-        fprintf(f,
-            "{\"endpoint\":\"http://127.0.0.1:%d\",\"port\":%d,\"token\":\"%s\","
-            "\"pid\":%lu,\"version\":\"%s\",\"apiVersion\":\"%s\"}\n",
-            port, port, g_token, GetCurrentProcessId(), ASB_PRODUCT_VER, ASB_API_VERSION);
-        fclose(f);
+    DeleteFileW(path);
+    if (!discovery_security(&sa)) {
+        hlog(L"discovery file NOT written: couldn't build its security descriptor (%lu)", GetLastError());
+        return;
     }
-    hlog(L"discovery file written: %s", path);
+    n = sprintf_s(body, sizeof(body),
+        "{\"endpoint\":\"http://127.0.0.1:%d\",\"port\":%d,\"token\":\"%s\","
+        "\"pid\":%lu,\"version\":\"%s\",\"apiVersion\":\"%s\"}\n",
+        port, port, g_token, GetCurrentProcessId(), ASB_PRODUCT_VER, ASB_API_VERSION);
+    h = CreateFileW(path, GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    LocalFree(sa.lpSecurityDescriptor);
+    if (h == INVALID_HANDLE_VALUE) {
+        hlog(L"discovery file NOT written: %s (%lu)", path, GetLastError());
+        return;
+    }
+    if (n < 0 || !WriteFile(h, body, (DWORD)n, &written, NULL) || written != (DWORD)n)
+        hlog(L"discovery file write failed (%lu)", GetLastError());
+    CloseHandle(h);
+    hlog(L"discovery file written: %s (SYSTEM, Administrators and this account only)", path);
 }
 
 static void delete_discovery(void)
