@@ -1,0 +1,108 @@
+# maxb35t fork: weekly check that the latest upstream release still merges into the fork
+# and builds. Nothing is pushed: the merge happens in the runner's scratch checkout. If the
+# merge conflicts or the build fails, an issue is opened (once per release) with the details.
+# Bringing a release in for real stays a normal PR that merges the tag (FORK.md: merge,
+# never rebase).
+name: upstream merge check
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find the latest upstream release
+        id: up
+        run: |
+          git remote add upstream https://github.com/jamesstringer90/appsandbox.git
+          git fetch --quiet --tags upstream
+          tag=$(git ls-remote --tags --refs upstream 'v*' | sed 's#.*refs/tags/##' | sort -V | tail -1)
+          if [ -z "$tag" ]; then echo "No upstream release tags found." >&2; exit 1; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$tag^{commit}" HEAD; then
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            echo "The fork already contains upstream **$tag**. Nothing to check." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream **$tag** isn't in the fork yet: trying a merge and a build." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Merge it (scratch only, not pushed)
+        id: merge
+        if: steps.up.outputs.merged == 'false'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          git config user.name "upstream-check"
+          git config user.email "upstream-check@invalid"
+          if git merge --no-edit "$TAG"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U | tee conflicts.txt
+          fi
+
+      - uses: microsoft/setup-msbuild@v2
+        if: steps.merge.outputs.ok == 'true'
+
+      - name: Build (same steps as fork build)
+        if: steps.merge.outputs.ok == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release\resources | Out-Null
+          msbuild AppSandbox.sln /t:AppSandboxCore /p:Configuration=Release /p:Platform=x64 /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          msbuild AppSandbox.sln /t:AppSandbox /p:Configuration=Release /p:Platform=x64 /v:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --manifest-path tools/asb-proxy/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Report a clean merge
+        if: steps.merge.outputs.ok == 'true' && success()
+        run: |
+          echo "Upstream **${{ steps.up.outputs.tag }}** merges cleanly and builds. Bring it in with a PR that merges the tag." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue
+        if: steps.up.outputs.merged == 'false' && (steps.merge.outputs.ok == 'false' || failure())
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.up.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MERGE_OK: ${{ steps.merge.outputs.ok }}
+        run: |
+          title="Upstream $TAG doesn't merge cleanly into the fork"
+          if [ "$MERGE_OK" = "true" ]; then title="Upstream $TAG merges but the fork no longer builds"; fi
+          if gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"Upstream $TAG\" in:title" --json number --jq '.[0].number' | grep -q .; then
+            echo "An open issue for $TAG already exists." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "The weekly upstream check tried merging upstream release \`$TAG\` (jamesstringer90/appsandbox) into \`main\`."
+            echo
+            if [ "$MERGE_OK" = "true" ]; then
+              echo "The merge was clean but the build failed. See the run's build log: $RUN_URL"
+            else
+              echo "The merge stopped on conflicts in:"
+              echo
+              sed 's/^/- `/; s/$/`/' conflicts.txt
+              echo
+              echo "Run: $RUN_URL"
+            fi
+            echo
+            echo "Resolve it in a PR that merges \`$TAG\` into \`main\` (FORK.md: merge, never rebase)."
+          } > body.md
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
