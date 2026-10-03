@@ -4,6 +4,8 @@ Windows agent VM with the GPU off and no display, run over SSH in session 0. Use
     python windows_env.py run  [OPTIONS] [--env-file F] -- COMMAND   one job in a fresh instance
     python windows_env.py test [OPTIONS]                              isolation + toolchain checks
     python windows_env.py measure [OPTIONS] [--parallel N]            build timings and memory
+    python windows_env.py jobtest [OPTIONS]                           one real engine job through agent-job.ps1
+                                                                      (run elevated: reads the agent's tokens)
 
 OPTIONS: --vm NAME (default AgentTest)  --snap NAME (default windows-agent-base-v1)
          --ram MB (default 6144)  --cores N (default: the VM's)  --gpu (environment 3: GPU on)
@@ -331,12 +333,92 @@ def cmd_measure(c, o):
     return 1 if bad else 0
 
 
+CRED_DIR = r"C:\engine-agent\cred"
+CLAUDE_VERSION = os.environ.get("ASB_CLAUDE_VERSION", "2.1.284")
+RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent-job.ps1")
+
+
+def cmd_jobtest(c, o):
+    """A real job through agent-job.ps1 in a fresh instance (`windows`, or `windows-desktop` with
+    --gpu): clone the engine repo with the agent's GitHub token, run `claude -p` with a trivial
+    prompt, check the records and that cred.env is gone. Tokens are never printed."""
+    import json
+    import secrets
+    ok = True
+    t0 = time.monotonic()
+
+    def check(cond, label):
+        nonlocal ok
+        ok &= bool(cond)
+        print("[%6.1fs] %s  %s" % (time.monotonic() - t0, "PASS" if cond else "FAIL", label), flush=True)
+
+    if not os.path.exists(RUNNER):
+        sys.exit("agent-job.ps1 must be next to windows_env.py (%s)" % RUNNER)
+    try:
+        claude_tok = open(os.path.join(CRED_DIR, "claude-oauth-token"), encoding="utf-8").read().strip()
+        gh_tok = open(os.path.join(CRED_DIR, "github-token"), encoding="utf-8").read().strip()
+    except OSError as e:
+        sys.exit("can't read the agent's tokens in %s (run elevated): %s" % (CRED_DIR, e.strerror))
+    job_id = "jobtest-" + secrets.token_hex(6)
+    job_spec = {"agent": "none", "claude_version": CLAUDE_VERSION, "effort": "low", "job_id": job_id,
+                "model": "sonnet", "timeout_s": 900, "workdir": "w-" + job_id[-12:]}
+    with Instance(c, o) as inst:
+        n = inst.name
+        check(True, "instance %s ready in %.0f s (%s)" % (n, inst.ready_s, "windows-desktop" if o.gpu else "windows"))
+        local = tempfile.mkdtemp(prefix="jobtest-")
+        try:
+            d = os.path.join(local, "in")
+            os.mkdir(d)
+            with open(os.path.join(d, "job.json"), "w", newline="\n") as f:
+                f.write(json.dumps(job_spec, separators=(",", ":")))
+            with open(os.path.join(d, "prompt.txt"), "w", newline="\n") as f:
+                f.write("Reply with exactly the word ok, then stop. Do not change any file.\n")
+            with open(os.path.join(d, "cred.env"), "w", newline="\n") as f:
+                f.write("CLAUDE_CODE_OAUTH_TOKEN=%s\nGH_TOKEN=%s\n" % (claude_tok, gh_tok))
+            c.put(n, d, JOB + "/")
+            c.put(n, RUNNER, JOB + "/agent-job.ps1")
+        finally:
+            shutil.rmtree(local, ignore_errors=True)
+        cmd = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\job\\agent-job.ps1'
+        if o.gpu:
+            code, out = c.run_desktop(n, cmd, timeout=1200)
+        else:
+            code, out, err = c.run(n, cmd, timeout=1200)
+            out = out + err
+        last = out.strip().splitlines()[-1] if out.strip() else ""
+        try:
+            status = json.loads(last)
+        except ValueError:
+            status = {}
+        check(status.get("state") == "done" and status.get("exit_code") == 0,
+              "job finished: state %s, exit %s, Claude Code %s%s" % (
+                  status.get("state"), status.get("exit_code"), status.get("claude_version"),
+                  (" (" + status.get("message", "") + ")") if status.get("message") else ""))
+        code, out = ps(c, n, "if (Test-Path C:\\job\\in\\cred.env) { 'cred-still-there' } else { 'cred-gone' }; "
+                              "Get-Content -Raw -TotalCount 2000 C:\\job\\out\\result.json")
+        check("cred-gone" in out, "cred.env deleted before Claude started")
+        body = out.split("cred-gone", 1)[-1].strip()
+        try:
+            res = json.loads(body)
+        except ValueError:
+            res = {}
+        models = sorted((res.get("modelUsage") or {}).keys())
+        check(res.get("is_error") is False and "ok" in str(res.get("result", "")).lower(),
+              "claude -p answered (%r, models %s)" % (str(res.get("result", ""))[:40], models))
+        if o.gpu:
+            code, out = c.run_desktop(n, "Get-CimInstance Win32_VideoController | Select-Object -Expand Name", powershell=True)
+            check("NVIDIA" in out.upper(), "the job's desktop session sees the GPU (%s)" % " / ".join(out.split("\n")).strip())
+    check(n not in [v["name"] for v in c.list()], "instance deleted after the job (credentials gone with it)")
+    print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
+    return 0 if ok else 1
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("run", "test", "measure"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("run", "test", "measure", "jobtest"):
         sys.exit(__doc__)
     o = parse(sys.argv[2:])
     c = asb.connect()
-    return {"run": cmd_run, "test": cmd_test, "measure": cmd_measure}[sys.argv[1]](c, o)
+    return {"run": cmd_run, "test": cmd_test, "measure": cmd_measure, "jobtest": cmd_jobtest}[sys.argv[1]](c, o)
 
 
 if __name__ == "__main__":

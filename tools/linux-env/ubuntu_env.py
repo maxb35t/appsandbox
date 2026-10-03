@@ -5,7 +5,10 @@
     python ubuntu_env.py install VM [SLOTS]  setup.sh install (needs the VM on NAT for now)
     python ubuntu_env.py proxied VM          setup.sh proxied (then switch the VM to Proxied)
     python ubuntu_env.py userns  VM          setup.sh userns (user-namespace settings, part of install)
+    python ubuntu_env.py jobs    VM          setup.sh jobs (engine job pieces and pinned versions, part of install)
     python ubuntu_env.py test    VM          check isolation once the VM is on Proxied
+    python ubuntu_env.py jobtest VM [SLOT]   one real engine job through agent-job (needs the agent's
+                                             tokens; run elevated, they're read from C:\engine-agent\cred)
 
 REF selects the fork branch or tag the VM fetches setup files from (default: main).
 """
@@ -141,6 +144,87 @@ def cmd_test(c, vm):
     return 0 if ok else 1
 
 
+CRED_DIR = r"C:\engine-agent\cred"
+CLAUDE_VERSION = os.environ.get("ASB_CLAUDE_VERSION", "2.1.284")
+
+
+def cmd_jobtest(c, vm, slot):
+    """A real job through agent-job: clone the engine repo with the agent's GitHub token, run
+    `claude -p` with a trivial prompt, then check the records, the slot wipe and that no credential
+    is left. Tokens are read on the host, copied in a file that agent-job deletes, never printed."""
+    import json
+    import secrets
+    ok = True
+    t0 = time.monotonic()
+
+    def check(cond, label):
+        nonlocal ok
+        ok &= bool(cond)
+        print("[%6.1fs] %s  %s" % (time.monotonic() - t0, "PASS" if cond else "FAIL", label), flush=True)
+
+    def sh(cmd, timeout=120):
+        code, out, err = c.run(vm, "bash -lc %s" % _q(cmd), timeout=timeout)
+        return code, (out + err).strip()
+
+    ready(c, vm)
+    try:
+        claude_tok = open(os.path.join(CRED_DIR, "claude-oauth-token"), encoding="utf-8").read().strip()
+        gh_tok = open(os.path.join(CRED_DIR, "github-token"), encoding="utf-8").read().strip()
+    except OSError as e:
+        sys.exit("can't read the agent's tokens in %s (run elevated): %s" % (CRED_DIR, e.strerror))
+    job_id = "jobtest-" + secrets.token_hex(6)
+    job = {"agent": "none", "claude_version": CLAUDE_VERSION, "effort": "low", "job_id": job_id,
+           "model": "sonnet", "timeout_s": 600, "workdir": "w-" + job_id[-12:]}
+    local = tempfile.mkdtemp(prefix="jobtest-")
+    try:
+        with open(os.path.join(local, "job.json"), "w", newline="\n") as f:
+            f.write(json.dumps(job, separators=(",", ":")))
+        with open(os.path.join(local, "prompt.txt"), "w", newline="\n") as f:
+            f.write("Reply with exactly the word ok, then stop. Do not change any file.\n")
+        with open(os.path.join(local, "cred.env"), "w", newline="\n") as f:
+            f.write("CLAUDE_CODE_OAUTH_TOKEN=%s\nGH_TOKEN=%s\n" % (claude_tok, gh_tok))
+        sh("mkdir -p ~/jobs")
+        c.put(vm, local, "jobs/" + job_id)
+    finally:
+        for n in os.listdir(local):
+            os.unlink(os.path.join(local, n))
+        os.rmdir(local)
+    code, out = sh("sudo -n agent-job start --slot %d --dir ~/jobs/%s; ls ~/jobs/%s" % (slot, job_id, job_id))
+    check('"state":"started"' in out, "job %s started in slot %d (%s)" % (job_id, slot, out.splitlines()[0][:120]))
+    check("cred.env" not in out, "cred.env deleted from the hand-over folder at start")
+    status = {}
+    for _ in range(300):
+        code, out = sh("sudo -n agent-job status %s" % job_id)
+        try:
+            status = json.loads(out)
+        except ValueError:
+            status = {}
+        if status.get("state") not in ("queued", "setup", "running"):
+            break
+        time.sleep(2)
+    check(status.get("state") == "done" and status.get("exit_code") == 0,
+          "job finished: state %s, exit %s, Claude Code %s" % (status.get("state"), status.get("exit_code"),
+                                                              status.get("claude_version")))
+    code, out = sh("sudo -n agent-job result %s" % job_id, timeout=120)
+    try:
+        res = json.loads(out)
+    except ValueError:
+        res = {}
+    models = sorted((res.get("modelUsage") or {}).keys())
+    check(res.get("is_error") is False and "ok" in str(res.get("result", "")).lower(),
+          "claude -p answered (%r, models %s)" % (str(res.get("result", ""))[:40], models))
+    check(status.get("workdir_removed") is True, "slot wiped after the job")
+    code, out = sh("sudo -n ls -A /srv/agents/%d/work /srv/agents/%d/tmp; sudo -n ls /var/lib/agent-jobs/%s; "
+                   "pgrep -u agent%d -c || true" % (slot, slot, job_id, slot))
+    check("cred.env" not in out and "job.env" not in out and ".job-env" not in out,
+          "no credential file left in the record or the slot")
+    check(out.strip().endswith("0"), "no process left for agent%d" % slot)
+    code, out = sh("sudo -n cat /var/lib/agent-jobs/%s/network.log | awk '{print $2}' | sort -u | tr '\\n' ' '" % job_id)
+    check("github.com:443" in out, "the slot's connection log has github.com (%s)" % out[:120])
+    print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
+    return 0 if ok else 1
+
+
 def _q(s):
     return "'" + s.replace("'", "'\\''") + "'"
 
@@ -157,8 +241,12 @@ def main():
         return fetch_and_run(c, vm, "install %s %s" % (REF, slots), timeout=3600)
     if what == "proxied":
         return fetch_and_run(c, vm, "proxied", timeout=600)
+    if what == "jobs":
+        return fetch_and_run(c, vm, "jobs %s" % REF, timeout=3600)
     if what == "userns":
         return fetch_and_run(c, vm, "userns", timeout=300)
+    if what == "jobtest":
+        return cmd_jobtest(c, vm, int(sys.argv[3]) if len(sys.argv) > 3 else 1)
     if what == "test":
         return cmd_test(c, vm)
     sys.exit(__doc__)

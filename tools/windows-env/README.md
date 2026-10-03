@@ -62,3 +62,18 @@ Each instance has 8 cores (the VM's default). The build is the `test` crate (ser
 - **Idle use is about 1.9 GB.** That includes the desktop the base still logs on to at boot. A lighter base without automatic logon wouldn't save enough to justify a base rebuild.
 - **4 GB is enough for small jobs.** The default is 6 GB, because "after build" isn't the peak: larger builds, such as a whole workspace, use more while they run.
 - **Running three at once** added about 4 s per build.
+
+## Engine agent jobs: `agent-job.ps1` (engine ADR 0020)
+
+`agent-job.ps1` is the job runner inside an instance. The driver copies it and the job's inputs into `C:\job` (`in\job.json`, `in\prompt.txt` and `in\cred.env`), then runs it:
+- over SSH for `windows`;
+- through `run_desktop` for `windows-desktop`.
+
+It applies the same rules as the engine's launcher, plus three checks:
+- **Claude Code pin:** the job is refused unless `claude --version` is exactly `claude_version`.
+- **Credentials:** `cred.env` holds exactly the two credentials and is deleted before anything runs.
+- **Revocation workaround:** as in the job wrapper above.
+
+Records go to `C:\job\out`, and the last line of output is the final status as JSON. They are untrusted, because the job runs as the same administrator. The instance is deleted after the job, taking the credentials with it.
+
+`windows_env.py jobtest [--gpu]` runs a real job with the agent's tokens in a fresh instance and checks it. Run it elevated.
