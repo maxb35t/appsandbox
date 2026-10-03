@@ -87,7 +87,7 @@ cmd_jobs() {
     log "Rust toolchains: $RUST_TOOLCHAINS"
     for t in $RUST_TOOLCHAINS; do
         RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH \
-            rustup toolchain install -q "$t" --profile default -c rustfmt -c clippy
+            rustup toolchain install "$t" --profile default -c rustfmt -c clippy
     done
     chmod -R a+rX /opt/rust
 

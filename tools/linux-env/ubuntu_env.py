@@ -1,4 +1,4 @@
-"""maxb35t fork: set up and test the Ubuntu agent VM from the Windows host (uses asb.py).
+r"""maxb35t fork: set up and test the Ubuntu agent VM from the Windows host (uses asb.py).
 
     python ubuntu_env.py sudo    VM          one-time: passwordless sudo for the VM's admin user
                                              (asks for its password once; never stored)
