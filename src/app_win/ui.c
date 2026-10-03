@@ -2289,14 +2289,20 @@ static DWORD WINAPI attach_event_thread(LPVOID unused)
         attach_forward(L"{\"action\":\"getState\"}");   /* full state once subscribed */
         buf = (char *)malloc(cap);
         while (buf) {
-            DWORD got = 0;
+            DWORD got = 0, avail = 0;
             char *frame_end;
-            if (len + 65536 + 1 > cap) {
+            /* Ask what has arrived, then read exactly that: a plain WinHttpReadData for a
+               big buffer can sit waiting to fill it, and our messages are small. Blocks
+               until data, a heartbeat (15 s) or the receive timeout. */
+            if (!WinHttpQueryDataAvailable(r, &avail) || avail == 0) break;   /* dropped */
+            if (avail > 1 << 20) avail = 1 << 20;
+            while (len + avail + 1 > cap) {
                 char *grown = (char *)realloc(buf, cap * 2);
-                if (!grown) break;
+                if (!grown) { free(buf); buf = NULL; break; }
                 buf = grown; cap *= 2;
             }
-            if (!WinHttpReadData(r, buf + len, 65536, &got) || got == 0) break;   /* dropped */
+            if (!buf) break;
+            if (!WinHttpReadData(r, buf + len, avail, &got) || got == 0) break;   /* dropped */
             len += got;
             buf[len] = '\0';
             /* Frames end with a blank line; each of ours is one "data: <json>" line. */
