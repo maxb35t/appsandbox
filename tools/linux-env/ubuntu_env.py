@@ -49,8 +49,9 @@ def cmd_sudo(c, vm):
 
 def fetch_and_run(c, vm, args, timeout):
     ready(c, vm)
-    cmd = ("curl -fsSL %s -o /tmp/asb-setup.sh && sudo -n bash /tmp/asb-setup.sh %s; rc=$?; "
-           "rm -f /tmp/asb-setup.sh; exit $rc") % (RAW, args)
+    # Ubuntu Desktop has wget but not curl (setup.sh installs curl for itself).
+    cmd = ("(command -v curl >/dev/null && curl -fsSL %s -o /tmp/asb-setup.sh || wget -q -O /tmp/asb-setup.sh %s) "
+           "&& sudo -n bash /tmp/asb-setup.sh %s; rc=$?; rm -f /tmp/asb-setup.sh; exit $rc") % (RAW, RAW, args)
     print("running in %s: setup.sh %s (this can take a while)" % (vm, args), flush=True)
     return show(*c.run(vm, cmd, timeout=timeout))
 
