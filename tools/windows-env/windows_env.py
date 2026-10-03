@@ -394,14 +394,21 @@ def cmd_jobtest(c, o):
               "job finished: state %s, exit %s, Claude Code %s%s" % (
                   status.get("state"), status.get("exit_code"), status.get("claude_version"),
                   (" (" + status.get("message", "") + ")") if status.get("message") else ""))
-        code, out = ps(c, n, "if (Test-Path C:\\job\\in\\cred.env) { 'cred-still-there' } else { 'cred-gone' }; "
-                              "Get-Content -Raw -TotalCount 2000 C:\\job\\out\\result.json")
+        code, out = ps(c, n, "if (Test-Path C:\\job\\in\\cred.env) { 'cred-still-there' } else { 'cred-gone' }")
         check("cred-gone" in out, "cred.env deleted before Claude started")
-        body = out.split("cred-gone", 1)[-1].strip()
+        # Copied back as a file: printing it through PowerShell over SSH can wrap long lines.
+        local = tempfile.mkdtemp(prefix="jobtest-out-")
+        raw = b""
         try:
-            res = json.loads(body)
-        except ValueError:
+            c.get(n, "C:/job/out/result.json", local)
+            with open(os.path.join(local, "result.json"), "rb") as f:
+                raw = f.read(4 * 1024 * 1024)
+            res = json.loads(raw.decode("utf-8-sig"))
+        except (OSError, RuntimeError, ValueError) as e:
+            print("    result.json unreadable: %s (%d bytes, starts %r)" % (e, len(raw), raw[:160]))
             res = {}
+        finally:
+            shutil.rmtree(local, ignore_errors=True)
         models = sorted((res.get("modelUsage") or {}).keys())
         check(res.get("is_error") is False and "ok" in str(res.get("result", "")).lower(),
               "claude -p answered (%r, models %s)" % (str(res.get("result", ""))[:40], models))
