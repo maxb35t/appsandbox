@@ -11,7 +11,7 @@ suggestions, so this fork is long-lived. Its patch set is kept small and self-co
   resources are used as they are.
 - New features are **switchable** (a setting or a per-request option). Changes that fix
   behaviour are not.
-- Upstream releases come in by **merge**, never by rebase.
+- Upstream releases come in by **merge**, never by rebase. A weekly workflow (`upstream merge check`) tries the latest upstream release in a scratch merge and build, and opens an issue if it conflicts or no longer builds.
 - Fork builds report their version as `<upstream>+mx.N` (`/v1/version`, `host.json`). The binaries'
   file versions use revision `N`.
 
