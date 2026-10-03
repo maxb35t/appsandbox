@@ -35,7 +35,7 @@ apart.
 
 | File | What it is |
 |---|---|
-| `setup.sh` | Runs as root in the VM. `install [REF] [SLOTS]` installs the packages, Node.js, sandbox-runtime (pinned), Rust in `/opt/rust`, the Claude Code CLI, the relay (asb-proxy built from this repo), the slots and `agent-run`. `proxied` points apt, git, curl and npm at the relay and boots the VM to the console. `slots N` adds slots. `userns` applies only the user-namespace settings above (also part of `install`). |
+| `setup.sh` | Runs as root in the VM. `install [REF] [SLOTS]` installs the packages, Node.js, sandbox-runtime (pinned), Rust in `/opt/rust`, the Claude Code CLI, the relay (asb-proxy built from this repo), the slots and `agent-run`. `proxied` points apt and the proxy environment variables (used by git, curl, npm and cargo) at the relay, and boots the VM to the console. git and npm keep no proxy in their own config, which would bypass sandbox-runtime's authenticated proxy inside a slot. `slots N` adds slots. `userns` applies only the user-namespace settings above (also part of `install`). |
 | `asb-relay.service` | systemd unit for `asb-proxy guest 127.0.0.1:3128 --port 8`. |
 | `agent-run`, `agent-run.mjs` | `sudo agent-run --slot N [--env-file FILE] -- COMMAND...` runs a command in slot N's sandbox as user `agentN`. `--env-file` adds `KEY=VALUE` lines (such as a job token) to the command's environment, then deletes the file, so the value is never on a command line. |
 | `ubuntu_env.py` | Host side, using `asb.py`. Subcommands: `sudo` (one-time passwordless sudo for the admin user), `install`, `proxied`, `userns`, `test` (the isolation checks). |

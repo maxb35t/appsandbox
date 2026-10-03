@@ -32,6 +32,23 @@ log() { echo "== $*"; }
 
 need_root() { [ "$(id -u)" = 0 ] || { echo "run as root (sudo)" >&2; exit 1; }; }
 
+# The fork at REF (a branch, tag or full commit ID; `git clone --branch` takes only the first two).
+fetch_src() {
+    local ref=$1 dir=$2
+    git init -q "$dir"
+    git -C "$dir" fetch -q --depth 1 "$REPO" "$ref"
+    git -C "$dir" checkout -q FETCH_HEAD
+}
+
+# git and npm take the proxy from the environment (/etc/environment and profile.d here; inside a slot,
+# sandbox-runtime's own authenticated proxy). A proxy in their config files would win over the
+# environment and send slot traffic to sandbox-runtime's proxy without its login (407).
+tool_proxy_from_env() {
+    git config --system --unset-all http.proxy 2>/dev/null || true
+    npm config delete --global proxy 2>/dev/null || true
+    npm config delete --global https-proxy 2>/dev/null || true
+}
+
 make_slots() {
     local n=$1 i
     mkdir -p /srv/agents
@@ -75,6 +92,7 @@ userns_setup() {
 cmd_jobs() {
     local ref=${1:-main} src have t
     export DEBIAN_FRONTEND=noninteractive
+    tool_proxy_from_env
     log "GitHub CLI"
     command -v gh >/dev/null || { apt-get update -q; apt-get install -y -q gh; }
 
@@ -87,13 +105,13 @@ cmd_jobs() {
     log "Rust toolchains: $RUST_TOOLCHAINS"
     for t in $RUST_TOOLCHAINS; do
         RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH \
-            rustup toolchain install -q "$t" --profile default -c rustfmt -c clippy
+            rustup toolchain install "$t" --profile default -c rustfmt -c clippy
     done
     chmod -R a+rX /opt/rust
 
     log "agent-job (from $REPO at $ref)"
     src=$(mktemp -d)
-    git clone -q --depth 1 --branch "$ref" "$REPO" "$src/appsandbox"
+    fetch_src "$ref" "$src/appsandbox"
     install -d "$LIB"
     install -m 644 "$src/appsandbox/tools/linux-env/agent-job.mjs" "$LIB/agent-job.mjs"
     rm -rf "$src"
@@ -139,7 +157,7 @@ P
 
     log "guest relay (asb-proxy from $REPO at $ref)"
     src=$(mktemp -d)
-    git clone -q --depth 1 --branch "$ref" "$REPO" "$src/appsandbox"
+    fetch_src "$ref" "$src/appsandbox"
     RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo PATH=/opt/rust/cargo/bin:$PATH \
         cargo build -q --release --manifest-path "$src/appsandbox/tools/asb-proxy/Cargo.toml"
     install -m 755 "$src/appsandbox/tools/asb-proxy/target/release/asb-proxy" /usr/local/bin/asb-proxy
@@ -175,9 +193,7 @@ no_proxy=localhost,127.0.0.1,::1
 P
     echo "Acquire::http::Proxy \"http://$RELAY\"; Acquire::https::Proxy \"http://$RELAY\";" \
         > /etc/apt/apt.conf.d/95asb-proxy
-    git config --system http.proxy "http://$RELAY"
-    npm config set --global proxy "http://$RELAY"
-    npm config set --global https-proxy "http://$RELAY"
+    tool_proxy_from_env
     log "boot to the console (the desktop can be switched back on: systemctl set-default graphical.target)"
     systemctl set-default multi-user.target
     log "done. Set the VM's network to Proxied (4) in App Sandbox and restart it."
