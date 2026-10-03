@@ -280,6 +280,23 @@ VM traffic reaches it over Hyper-V socket channel 8.
 | `proxy_log(vm=None, limit=100)` / `clear_proxy_log()` | Recent connections: time, VM, method, host, port, IP, result (`ok`, `denied:...`, `error:...`), bytes in each direction, duration. `clear_proxy_log()` (`DELETE /v1/proxy/log`) empties the log. Status objects carry `startedAt` (unix time of the last start, 0 when stopped) to tell runs apart. |
 | `create_instance(..., proxy=...)` | A Proxied instance's own rules from the start: `None` = its parent's, `"defaults"` = the global defaults, or a dict such as `{"allow": "github.com", "ports": "443"}` (keys `blockPrivate`, `ports`, `allow`, `deny`, `log`). API body keys: `proxyCustom` (false = defaults) or `proxyBlockPrivate`, `proxyPorts`, `proxyAllow`, `proxyDeny`, `proxyLog`. |
 
+### Commands and files in a VM *(maxb35t fork)*
+
+These helpers use SSH over App Sandbox's own channel, with the key App Sandbox deploys (`sshDeployKey`). Nothing extra is installed in the VM. They need the VM running with SSH ready (`ssh_info(name)["sshState"] == 4`) and the OpenSSH client (`ssh`, `scp`) on the host.
+
+| Method | What it does |
+|---|---|
+| `run(name, command, timeout=600)` | Runs a command over SSH and returns `(exit_code, stdout, stderr)`. On Windows it runs in the SSH session (session 0), which has no desktop and no GPU/Vulkan. |
+| `run_ps(name, script)` | The same for a PowerShell script. The script is sent encoded, so there are no quoting problems. |
+| `put(name, local, remote)` / `get(name, remote, local)` | Copies a file or folder in or out (`scp -r`). Remote paths use forward slashes, e.g. `C:/Users/User/work`. The remote parent folder must exist. |
+| `run_desktop(name, command, timeout=600, powershell=False)` | Runs a command in the logged-in desktop session (session 1) of a Windows VM, where the GPU, Vulkan and windows work. It uses a one-off scheduled task as the logged-on user (Windows' own `schtasks`, nothing installed), waits, and returns `(exit_code, output)`. It raises if nobody is logged on. |
+
+```python
+code, out, err = c.run("AgentTest-1", "cargo --version")
+c.put("AgentTest-1", r"C:\jobs\repo", "C:/Users/User/work/")
+code, out = c.run_desktop("AgentTest-1", r"C:\Users\User\work\repo\target\release\gpu-test.exe")
+```
+
 ### Events (SSE)
 `events()` is a generator yielding parsed dicts as the daemon pushes them. It
 **blocks** — run it in a thread. Event shapes:
