@@ -183,6 +183,15 @@ HRESULT proxy_mgr_clear_log(void)
     return S_OK;
 }
 
+/* strstr ignoring ASCII case: VM names are case-insensitive everywhere else in the API. */
+static const char *ci_strstr(const char *hay, const char *needle)
+{
+    size_t n = strlen(needle);
+    for (; *hay; hay++)
+        if (_strnicmp(hay, needle, n) == 0) return hay;
+    return NULL;
+}
+
 int proxy_mgr_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap)
 {
     wchar_t dir[MAX_PATH], path[MAX_PATH];
@@ -222,7 +231,7 @@ int proxy_mgr_read_log(const wchar_t *vm_name, int limit, char *out, size_t cap)
     while (*p && count < 20000) {
         end = strchr(p, '\n');
         if (end) *end = '\0';
-        if (p[0] == '{' && (!needle[0] || strstr(p, needle))) lines[count++] = p;
+        if (p[0] == '{' && (!needle[0] || ci_strstr(p, needle))) lines[count++] = p;
         if (!end) break;
         p = end + 1;
     }

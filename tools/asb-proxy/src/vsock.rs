@@ -1,6 +1,7 @@
 //! Linux AF_VSOCK client (guest side), hand-declared libc FFI.
 
 use crate::duplex::Duplex;
+use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
@@ -32,8 +33,8 @@ struct Timeval {
 extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     fn connect(fd: i32, addr: *const SockaddrVm, len: u32) -> i32;
-    fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
-    fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+    fn read(fd: i32, buf: *mut c_void, n: usize) -> isize;
+    fn write(fd: i32, buf: *const c_void, n: usize) -> isize;
     fn shutdown(fd: i32, how: i32) -> i32;
     fn setsockopt(fd: i32, level: i32, name: i32, val: *const u8, len: u32) -> i32;
 }
@@ -63,7 +64,7 @@ impl VsockStream {
 impl Read for VsockStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // SAFETY: `buf` is valid for its length.
-        let n = unsafe { read(self.0.as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+        let n = unsafe { read(self.0.as_raw_fd(), buf.as_mut_ptr() as *mut c_void, buf.len()) };
         if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
     }
 }
@@ -71,7 +72,7 @@ impl Read for VsockStream {
 impl Write for VsockStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // SAFETY: `buf` is valid for its length.
-        let n = unsafe { write(self.0.as_raw_fd(), buf.as_ptr(), buf.len()) };
+        let n = unsafe { write(self.0.as_raw_fd(), buf.as_ptr() as *const c_void, buf.len()) };
         if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
     }
     fn flush(&mut self) -> io::Result<()> {
