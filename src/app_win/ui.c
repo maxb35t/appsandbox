@@ -23,10 +23,12 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <shlobj.h>
+#include <winhttp.h>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -80,6 +82,15 @@ static DWORD g_ui_thread_id;
 static BOOL g_is_home_edition = FALSE;
 static BOOL g_prereq_ok = FALSE;
 static BOOL g_prereq_reboot_pending = FALSE;
+
+/* fork: Phase C. g_served: this process is the headless daemon serving an attached GUI
+   (no window; webview2_post goes to the daemon's UI event stream). g_attached: this
+   process is a GUI attached to the daemon (no core; actions go over the local API). */
+static BOOL g_served = FALSE;
+static BOOL g_attached = FALSE;
+#define WM_ATTACH_MSG          (WM_APP + 30)
+static void attach_forward(const wchar_t *json);
+static void attach_start(void);
 
 static BOOL detect_home_edition(void)
 {
@@ -198,7 +209,10 @@ static void send_disk_space(const wchar_t *json, BOOL query)
     jb_int(&jb, L"freeGb", free_gb);
     jb_object_end(&jb);
     /* WebView2 is apartment-bound; deliver the response on the UI thread. */
-    if (!PostMessageW(g_hwnd_main, WM_DISK_SPACE, 0, (LPARAM)response))
+    if (g_served) {   /* fork: daemon -- the hook is thread-safe */
+        webview2_post(response);
+        HeapFree(GetProcessHeap(), 0, response);
+    } else if (!PostMessageW(g_hwnd_main, WM_DISK_SPACE, 0, (LPARAM)response))
         HeapFree(GetProcessHeap(), 0, response);
     HeapFree(GetProcessHeap(), 0, path);
 }
@@ -734,6 +748,10 @@ static void ui_log_post(const wchar_t *msg)
 
 static void ui_show_alert(const wchar_t *message)
 {
+    if (g_served) {   /* fork: daemon -- any thread, escaped */
+        ui_served_alert(message);
+        return;
+    }
     if (GetCurrentThreadId() == g_ui_thread_id) {
         wchar_t buf[1024];
         swprintf_s(buf, 1024, L"{\"type\":\"alert\",\"message\":\"%s\"}", message);
@@ -1098,6 +1116,22 @@ static void on_webview2_message(const wchar_t *json)
 
     if (!json_get_string(json, L"action", action, 64))
         return;
+
+    if (g_attached) {
+        /* fork: attached to the daemon. Window-only actions stay here; everything
+           else runs in the daemon, whose replies arrive on the UI event stream. */
+        if (wcscmp(action, L"uiReady") == 0) {
+            webview2_flush_queue();
+            webview2_post(L"{\"type\":\"attachState\",\"state\":\"connecting\"}");
+            attach_start();
+            return;
+        }
+        if (wcscmp(action, L"setMinSize") != 0 && wcscmp(action, L"browseImage") != 0 &&
+            wcscmp(action, L"browseDiskDirectory") != 0) {
+            attach_forward(json);
+            return;
+        }
+    }
 
     if (wcscmp(action, L"uiReady") == 0) {
         /* JS has loaded and registered its message listener; deliver any
@@ -1632,12 +1666,14 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     g_is_home_edition = detect_home_edition();
     asb_set_hinstance(hInstance);
 
-    /* Set library callbacks before init */
-    asb_set_log_callback(ui_log_callback, NULL);
-    asb_set_state_callback(ui_state_callback, NULL);
-    asb_set_progress_callback(ui_progress_callback, NULL);
-    asb_set_alert_callback(ui_alert_callback, NULL);
-    asb_set_vm_removed_callback(ui_vm_removed_callback, NULL);
+    /* Set library callbacks before init (fork: an attached GUI runs no core) */
+    if (!g_attached) {
+        asb_set_log_callback(ui_log_callback, NULL);
+        asb_set_state_callback(ui_state_callback, NULL);
+        asb_set_progress_callback(ui_progress_callback, NULL);
+        asb_set_alert_callback(ui_alert_callback, NULL);
+        asb_set_vm_removed_callback(ui_vm_removed_callback, NULL);
+    }
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
@@ -1653,7 +1689,8 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
         return NULL;
 
     hwnd = CreateWindowExW(
-        0, L"AppSandbox_Main", L"App Sandbox",
+        0, L"AppSandbox_Main",
+        g_attached ? L"App Sandbox \u2014 attached to the headless service" : L"App Sandbox",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1575, 900,
         NULL, NULL, hInstance, NULL);
@@ -1685,8 +1722,15 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             MessageBoxW(hwnd, L"WebView2 initialization failed.\nPlease install Microsoft Edge WebView2 Runtime.",
                         L"App Sandbox", MB_ICONERROR);
         }
-        tray_add(hwnd);
+        if (!g_attached) tray_add(hwnd);   /* fork: the daemon owns the VMs */
         return 0;
+
+    case WM_ATTACH_MSG:   /* fork: a message from the daemon's UI event stream */
+    {
+        wchar_t *m = (wchar_t *)lp;
+        if (m) { webview2_post(m); free(m); }
+        return 0;
+    }
 
     case WM_SIZE:
         webview2_resize(hwnd);
@@ -1955,6 +1999,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         int i, count = asb_vm_count();
         BOOL has_running = FALSE;
+        if (g_attached) {   /* fork: VMs belong to the daemon and keep running */
+            DestroyWindow(hwnd);
+            return 0;
+        }
         for (i = 0; i < count; i++) {
             if (asb_vm_is_running(asb_vm_get(i))) { has_running = TRUE; break; }
         }
@@ -2002,6 +2050,11 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
     {
         int i;
+        if (g_attached) {   /* fork: nothing of ours to tear down but the window */
+            webview2_cleanup();
+            PostQuitMessage(0);
+            return 0;
+        }
         tray_remove();
         webview2_cleanup();
         for (i = 0; i < ASB_MAX_VMS; i++) {
@@ -2015,4 +2068,274 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* ======================================================================
+   fork: Phase C -- the GUI and the headless daemon at the same time.
+
+   Daemon side (ui_served_*): the daemon runs this file's own action handler and
+   JSON builders for an attached GUI. webview2_post is hooked (headless.c) to its UI
+   event stream, so every message the GUI would draw reaches the attached window.
+
+   GUI side (ui_attach_*): when the daemon holds the single-instance lock, the GUI
+   attaches instead of refusing. It runs no core: actions go to POST /v1/ui/action,
+   and messages arrive from GET /v1/ui/events (server-sent events).
+   ====================================================================== */
+
+void ui_served_init(void)
+{
+    g_served = TRUE;
+    g_prereq_ok = TRUE;                       /* the daemon checked prerequisites */
+    g_ui_thread_id = GetCurrentThreadId();    /* the request thread runs the handler */
+}
+
+void ui_served_action(const wchar_t *json)
+{
+    wchar_t action[64] = { 0 };
+    if (!json_get_string(json, L"action", action, 64)) return;
+    if (wcscmp(action, L"uiReady") == 0 || wcscmp(action, L"getState") == 0) {
+        send_full_state();
+        return;
+    }
+    /* Window-only or install-time actions: the attached GUI handles or never sends them. */
+    if (wcscmp(action, L"setMinSize") == 0 || wcscmp(action, L"browseImage") == 0 ||
+        wcscmp(action, L"browseDiskDirectory") == 0 || wcscmp(action, L"enableFeature") == 0 ||
+        wcscmp(action, L"enableFeatureReboot") == 0)
+        return;
+    if (wcscmp(action, L"getDiskSpace") == 0) {   /* no window to post back to: answer inline */
+        send_disk_space(json, TRUE);
+        return;
+    }
+    on_webview2_message(json);
+}
+
+void ui_served_refresh(void)
+{
+    send_vm_list();
+}
+
+void ui_served_log(const wchar_t *msg)
+{
+    ui_log_post(msg);
+}
+
+void ui_served_alert(const wchar_t *msg)
+{
+    wchar_t buf[2048];
+    JsonBuilder jb;
+    jb_init(&jb, buf, ARRAYSIZE(buf));
+    jb_object_begin(&jb);
+    jb_string(&jb, L"type", L"alert");
+    jb_string(&jb, L"message", msg ? msg : L"");
+    jb_object_end(&jb);
+    webview2_post(buf);
+}
+
+/* ---- GUI side ---- */
+
+static INTERNET_PORT g_att_port = 0;
+static char g_att_token[64];
+static CRITICAL_SECTION g_att_cs;
+static HANDLE g_att_wake = NULL;
+typedef struct AttAction { struct AttAction *next; char *body; } AttAction;
+static AttAction *g_att_head = NULL, *g_att_tail = NULL;
+static volatile LONG g_att_started = 0;
+
+/* Reads port and token from %ProgramData%\AppSandbox\host.json (written by the daemon). */
+static BOOL attach_read_discovery(void)
+{
+    wchar_t base[MAX_PATH], path[MAX_PATH];
+    char text[1024] = { 0 }, *p, *q;
+    FILE *f = NULL;
+    size_t n;
+    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH)) wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(path, MAX_PATH, L"%s\\AppSandbox\\host.json", base);
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return FALSE;
+    n = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    text[n] = '\0';
+    p = strstr(text, "\"port\":");
+    if (!p) return FALSE;
+    g_att_port = (INTERNET_PORT)atoi(p + 7);
+    p = strstr(text, "\"token\":\"");
+    if (!p) return FALSE;
+    p += 9;
+    q = strchr(p, '"');
+    if (!q || q - p >= (int)sizeof(g_att_token)) return FALSE;
+    memcpy(g_att_token, p, q - p);
+    g_att_token[q - p] = '\0';
+    return g_att_port != 0;
+}
+
+/* One HTTP request to the daemon. Returns the open request handle on a 2xx status
+   (the caller reads the body and closes all three handles), or NULL. */
+static HINTERNET attach_open(const wchar_t *verb, const wchar_t *path, const char *body,
+                             DWORD body_len, DWORD timeout_ms, HINTERNET *sess, HINTERNET *conn)
+{
+    HINTERNET req = NULL;
+    wchar_t hdr[160];
+    DWORD status = 0, sz = sizeof(status);
+    *sess = WinHttpOpen(L"AppSandbox-attach", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
+    *conn = *sess ? WinHttpConnect(*sess, L"127.0.0.1", g_att_port, 0) : NULL;
+    if (*conn) req = WinHttpOpenRequest(*conn, verb, path, NULL, NULL, NULL, 0);
+    if (!req) goto fail;
+    WinHttpSetTimeouts(req, 5000, 5000, 15000, timeout_ms);
+    swprintf_s(hdr, ARRAYSIZE(hdr), L"Authorization: Bearer %S\r\nContent-Type: application/json\r\n", g_att_token);
+    if (!WinHttpSendRequest(req, hdr, (DWORD)-1, (LPVOID)body, body_len, body_len, 0) ||
+        !WinHttpReceiveResponse(req, NULL) ||
+        !WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX) ||
+        status < 200 || status >= 300)
+        goto fail;
+    return req;
+fail:
+    if (req) WinHttpCloseHandle(req);
+    if (*conn) WinHttpCloseHandle(*conn);
+    if (*sess) WinHttpCloseHandle(*sess);
+    *conn = *sess = NULL;
+    return NULL;
+}
+
+static void attach_close(HINTERNET req, HINTERNET conn, HINTERNET sess)
+{
+    if (req) WinHttpCloseHandle(req);
+    if (conn) WinHttpCloseHandle(conn);
+    if (sess) WinHttpCloseHandle(sess);
+}
+
+BOOL ui_attach_probe(void)
+{
+    HINTERNET s, c, r;
+    if (!attach_read_discovery()) return FALSE;
+    r = attach_open(L"GET", L"/v1/settings", NULL, 0, 5000, &s, &c);   /* authenticated route */
+    if (!r) return FALSE;
+    attach_close(r, c, s);
+    InitializeCriticalSection(&g_att_cs);
+    g_att_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    g_attached = TRUE;
+    return TRUE;
+}
+
+static void attach_post_local(const wchar_t *json)
+{
+    size_t len = wcslen(json) + 1;
+    wchar_t *copy = (wchar_t *)malloc(len * sizeof(wchar_t));
+    if (!copy) return;
+    wcscpy_s(copy, len, json);
+    if (!g_hwnd_main || !PostMessageW(g_hwnd_main, WM_ATTACH_MSG, 0, (LPARAM)copy)) free(copy);
+}
+
+static void attach_forward(const wchar_t *json)
+{
+    AttAction *a;
+    int n = WideCharToMultiByte(CP_UTF8, 0, json, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) return;
+    a = (AttAction *)calloc(1, sizeof(AttAction));
+    if (!a) return;
+    a->body = (char *)malloc((size_t)n);
+    if (!a->body) { free(a); return; }
+    WideCharToMultiByte(CP_UTF8, 0, json, -1, a->body, n, NULL, NULL);
+    EnterCriticalSection(&g_att_cs);
+    if (g_att_tail) g_att_tail->next = a; else g_att_head = a;
+    g_att_tail = a;
+    LeaveCriticalSection(&g_att_cs);
+    SetEvent(g_att_wake);
+}
+
+/* Sends queued actions to the daemon, in order. */
+static DWORD WINAPI attach_action_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        AttAction *a;
+        WaitForSingleObject(g_att_wake, INFINITE);
+        for (;;) {
+            HINTERNET s, c, r;
+            EnterCriticalSection(&g_att_cs);
+            a = g_att_head;
+            if (a) { g_att_head = a->next; if (!g_att_head) g_att_tail = NULL; }
+            LeaveCriticalSection(&g_att_cs);
+            if (!a) break;
+            r = attach_open(L"POST", L"/v1/ui/action", a->body, (DWORD)strlen(a->body), 120000, &s, &c);
+            if (r) attach_close(r, c, s);
+            else attach_post_local(L"{\"type\":\"alert\",\"message\":\"The headless service didn't accept that action. Is it still running?\"}");
+            SecureZeroMemory(a->body, strlen(a->body));   /* may hold a VM password */
+            free(a->body);
+            free(a);
+        }
+    }
+}
+
+/* Reads the daemon's UI event stream and posts each message to the window.
+   Reconnects (re-reading host.json, so a restarted daemon is found) when it drops. */
+static DWORD WINAPI attach_event_thread(LPVOID unused)
+{
+    BOOL was_connected = FALSE;
+    (void)unused;
+    for (;;) {
+        HINTERNET s, c, r;
+        size_t cap = 1 << 20, len = 0;
+        char *buf;
+        if (!attach_read_discovery() ||
+            !(r = attach_open(L"GET", L"/v1/ui/events", NULL, 0, 60000, &s, &c))) {
+            attach_post_local(was_connected
+                ? L"{\"type\":\"attachState\",\"state\":\"lost\"}"
+                : L"{\"type\":\"attachState\",\"state\":\"connecting\"}");
+            Sleep(2000);
+            continue;
+        }
+        was_connected = TRUE;
+        attach_post_local(L"{\"type\":\"attachState\",\"state\":\"connected\"}");
+        attach_forward(L"{\"action\":\"getState\"}");   /* full state once subscribed */
+        buf = (char *)malloc(cap);
+        while (buf) {
+            DWORD got = 0, avail = 0;
+            char *frame_end;
+            /* Ask what has arrived, then read exactly that: a plain WinHttpReadData for a
+               big buffer can sit waiting to fill it, and our messages are small. Blocks
+               until data, a heartbeat (15 s) or the receive timeout. */
+            if (!WinHttpQueryDataAvailable(r, &avail) || avail == 0) break;   /* dropped */
+            if (avail > 1 << 20) avail = 1 << 20;
+            while (len + avail + 1 > cap) {
+                char *grown = (char *)realloc(buf, cap * 2);
+                if (!grown) { free(buf); buf = NULL; break; }
+                buf = grown; cap *= 2;
+            }
+            if (!buf) break;
+            if (!WinHttpReadData(r, buf + len, avail, &got) || got == 0) break;   /* dropped */
+            len += got;
+            buf[len] = '\0';
+            /* Frames end with a blank line; each of ours is one "data: <json>" line. */
+            while ((frame_end = strstr(buf, "\n\n")) != NULL) {
+                *frame_end = '\0';
+                if (strncmp(buf, "data: ", 6) == 0) {
+                    int wn = MultiByteToWideChar(CP_UTF8, 0, buf + 6, -1, NULL, 0);
+                    wchar_t *w = wn > 0 ? (wchar_t *)malloc((size_t)wn * sizeof(wchar_t)) : NULL;
+                    if (w) {
+                        MultiByteToWideChar(CP_UTF8, 0, buf + 6, -1, w, wn);
+                        if (!g_hwnd_main || !PostMessageW(g_hwnd_main, WM_ATTACH_MSG, 0, (LPARAM)w)) free(w);
+                    }
+                }
+                len -= (size_t)(frame_end + 2 - buf);
+                memmove(buf, frame_end + 2, len + 1);
+            }
+        }
+        free(buf);
+        attach_close(r, c, s);
+        attach_post_local(L"{\"type\":\"attachState\",\"state\":\"lost\"}");
+        Sleep(1000);
+    }
+}
+
+static void attach_start(void)
+{
+    HANDLE t;
+    if (InterlockedCompareExchange(&g_att_started, 1, 0) != 0) {
+        attach_forward(L"{\"action\":\"getState\"}");   /* page reloaded: just resend state */
+        return;
+    }
+    t = CreateThread(NULL, 0, attach_action_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    t = CreateThread(NULL, 0, attach_event_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
 }

@@ -566,6 +566,12 @@ tr.instance-row td:first-child { padding-left: 18px; }
 #btn-proxy-activity { margin-left: auto; margin-right: 8px; height: 26px; }
 #btn-settings { margin-right: 8px; height: 26px; }
 
+/* fork: attached to the headless service */
+.attach-banner { flex-shrink: 0; margin: 0 0 8px; padding: 6px 10px; border-radius: var(--radius);
+    font-size: 12px; border: 1px solid; }
+.attach-banner.ok { color: var(--accent); border-color: #2c5d8a; background: #1d2a36; }
+.attach-banner.warn { color: var(--warning); border-color: #6b6200; background: #2b2a14; }
+
 /* fork: Proxied network mode */
 .modal-form-body textarea {
     width: 100%; resize: vertical; min-height: 40px;
