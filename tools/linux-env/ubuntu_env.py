@@ -102,6 +102,7 @@ def cmd_test(c, vm):
     check("No such file" in out and "write-refused" in out, "slot 2 can't read or write slot 1 (%r)" % out[:80])
 
     # Token by env-file: reaches the command, never on a command line, file removed
+    # Written with Windows line endings (text mode), as a host-side job would: agent-run accepts both.
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=".env") as f:
         f.write("JOB_TOKEN=test-token-123\n")
         local = f.name
@@ -133,7 +134,8 @@ def cmd_test(c, vm):
     check(all(("done%d" % n) in results[n][0][1] for n in (1, 2)) and both < 9,
           "two slots run at the same time (%.1f s for two 5 s jobs)" % both)
 
-    log = c.proxy_log(vm=vm, limit=200)
+    # The daemon's own spelling of the name: older builds filter the log case-sensitively.
+    log = c.proxy_log(vm=st.get("name", vm), limit=200)
     check(any(e.get("host") == "example.com" for e in log), "host Proxy activity shows the slot's example.com")
     print("\nALL PASS" if ok else "\nSOME CHECKS FAILED")
     return 0 if ok else 1

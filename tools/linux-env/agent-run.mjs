@@ -21,7 +21,7 @@ process.env.CLAUDE_CODE_TMPDIR = `${home}/tmp`
 const jobEnv = {}
 if (process.env.ASB_JOB_ENV) {
   const f = process.env.ASB_JOB_ENV
-  for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+  for (const line of fs.readFileSync(f, 'utf8').split(/\r?\n/)) {
     const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line)
     if (m) jobEnv[m[1]] = m[2]
   }
