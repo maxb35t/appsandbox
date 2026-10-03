@@ -21,14 +21,24 @@ aren't listed, so `agent-run` passes one that allows and logs each host. Filteri
 the host proxy. sandbox-runtime still provides the network namespace, the filesystem rules and
 the per-slot log.
 
+**Why AppArmor's bubblewrap profile is disabled.** sandbox-runtime needs user namespaces that
+carry capabilities: bubblewrap creates one, and srt's `apply-seccomp` creates a nested one to
+get `CAP_SYS_ADMIN` for its PID and mount namespaces. Ubuntu blocks this in two ways. The
+sysctl `kernel.apparmor_restrict_unprivileged_userns` covers unconfined programs. The AppArmor
+profile `bwrap-userns-restrict` runs everything bubblewrap starts under `unpriv_bwrap`, which
+denies every capability (seen as `apply-seccomp: write /proc/self/setgroups ... Permission
+denied`). `setup.sh` sets the sysctl to 0 and disables that profile. The cost is more kernel
+attack surface inside the VM; the VM is the boundary for that, and srt still keeps the slots
+apart.
+
 ## Files
 
 | File | What it is |
 |---|---|
-| `setup.sh` | Runs as root in the VM. `install [REF] [SLOTS]` installs the packages, Node.js, sandbox-runtime (pinned), Rust in `/opt/rust`, the Claude Code CLI, the relay (asb-proxy built from this repo), the slots and `agent-run`. `proxied` points apt, git, curl and npm at the relay and boots the VM to the console. `slots N` adds slots. |
+| `setup.sh` | Runs as root in the VM. `install [REF] [SLOTS]` installs the packages, Node.js, sandbox-runtime (pinned), Rust in `/opt/rust`, the Claude Code CLI, the relay (asb-proxy built from this repo), the slots and `agent-run`. `proxied` points apt, git, curl and npm at the relay and boots the VM to the console. `slots N` adds slots. `userns` applies only the user-namespace settings above (also part of `install`). |
 | `asb-relay.service` | systemd unit for `asb-proxy guest 127.0.0.1:3128 --port 8`. |
 | `agent-run`, `agent-run.mjs` | `sudo agent-run --slot N [--env-file FILE] -- COMMAND...` runs a command in slot N's sandbox as user `agentN`. `--env-file` adds `KEY=VALUE` lines (such as a job token) to the command's environment, then deletes the file, so the value is never on a command line. |
-| `ubuntu_env.py` | Host side, using `asb.py`. Subcommands: `sudo` (one-time passwordless sudo for the admin user), `install`, `proxied`, `test` (the isolation checks). |
+| `ubuntu_env.py` | Host side, using `asb.py`. Subcommands: `sudo` (one-time passwordless sudo for the admin user), `install`, `proxied`, `userns`, `test` (the isolation checks). |
 
 ## Building the VM
 

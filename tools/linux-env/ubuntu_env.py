@@ -4,6 +4,7 @@
                                              (asks for its password once; never stored)
     python ubuntu_env.py install VM [SLOTS]  setup.sh install (needs the VM on NAT for now)
     python ubuntu_env.py proxied VM          setup.sh proxied (then switch the VM to Proxied)
+    python ubuntu_env.py userns  VM          setup.sh userns (user-namespace settings, part of install)
     python ubuntu_env.py test    VM          check isolation once the VM is on Proxied
 
 REF selects the fork branch or tag the VM fetches setup files from (default: main).
@@ -154,6 +155,8 @@ def main():
         return fetch_and_run(c, vm, "install %s %s" % (REF, slots), timeout=3600)
     if what == "proxied":
         return fetch_and_run(c, vm, "proxied", timeout=600)
+    if what == "userns":
+        return fetch_and_run(c, vm, "userns", timeout=300)
     if what == "test":
         return cmd_test(c, vm)
     sys.exit(__doc__)

@@ -9,6 +9,7 @@
 #                                    curl, npm and cargo, and boot to the console. Then set
 #                                    the VM's network to Proxied (4) in App Sandbox.
 #   setup.sh slots N                 make sure slots 1..N exist.
+#   setup.sh userns                  only the user-namespace settings srt needs (part of install).
 set -euo pipefail
 
 REPO=https://github.com/maxb35t/appsandbox
@@ -38,6 +39,27 @@ make_slots() {
     log "slots 1..$n ready under /srv/agents"
 }
 
+# sandbox-runtime needs user namespaces that carry capabilities: bwrap makes one, and
+# srt's apply-seccomp makes a nested one to get CAP_SYS_ADMIN for its PID/mount unshare.
+# Ubuntu blocks both: the sysctl below covers unconfined programs, and the AppArmor
+# profile bwrap-userns-restrict confines everything bwrap starts to unpriv_bwrap, which
+# denies all capabilities. That profile is unloaded and disabled here (user's decision:
+# the VM only runs agents and is the kernel boundary; srt still isolates the slots).
+userns_setup() {
+    log "sandbox-runtime needs capability-bearing user namespaces (Ubuntu restricts them)"
+    echo 'kernel.apparmor_restrict_unprivileged_userns = 0' > /etc/sysctl.d/60-agent-sandbox.conf
+    sysctl -q --system
+    local prof=/etc/apparmor.d/bwrap-userns-restrict
+    if [ -f "$prof" ]; then
+        mkdir -p /etc/apparmor.d/disable
+        ln -sf "$prof" /etc/apparmor.d/disable/bwrap-userns-restrict
+        if grep -qw unpriv_bwrap /sys/kernel/security/apparmor/profiles 2>/dev/null; then
+            apparmor_parser -R "$prof"
+        fi
+        log "AppArmor profile bwrap-userns-restrict disabled"
+    fi
+}
+
 cmd_install() {
     local ref=${1:-main} slots=${2:-4} src
     export DEBIAN_FRONTEND=noninteractive
@@ -47,9 +69,7 @@ cmd_install() {
     apt-get install -y -q bubblewrap socat ripgrep git build-essential pkg-config curl ca-certificates \
         jq nodejs npm openssh-server
 
-    log "sandbox-runtime needs capability-bearing user namespaces (Ubuntu restricts them)"
-    echo 'kernel.apparmor_restrict_unprivileged_userns = 0' > /etc/sysctl.d/60-agent-sandbox.conf
-    sysctl -q --system
+    userns_setup
 
     log "Rust (system-wide in /opt/rust; each slot keeps its own cargo cache)"
     if [ ! -x /opt/rust/cargo/bin/rustc ]; then
@@ -118,5 +138,6 @@ case "${1:-}" in
     install) shift; cmd_install "$@" ;;
     proxied) cmd_proxied ;;
     slots)   make_slots "${2:?count}" ;;
-    *) sed -n '2,13p' "$0"; exit 2 ;;
+    userns)  userns_setup ;;
+    *) sed -n '2,14p' "$0"; exit 2 ;;
 esac
